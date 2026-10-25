@@ -4,10 +4,12 @@
  * Polls the Host for a pending sudo confirmation and, while one exists, takes
  * over the current Session's composer with a password panel. Approving posts
  * the password once to the Host; it never becomes a chat message, so it never
- * reaches the model context or the session log.
+ * reaches the model context or the session log. Rejecting may carry an optional
+ * reason written by the user.
  *
- * Pure view code: no Harness Client package is imported, styling uses only
- * `--dsw-alias-*` tokens, and every resource is owned by `apply`.
+ * Pure view code: no Harness Client package is imported, the card borrows the
+ * composer geometry tokens so it lines up with the chat box, and every resource
+ * is owned by `apply`.
  */
 
 window.__ModuleLoader__.load({
@@ -19,6 +21,7 @@ window.__ModuleLoader__.load({
     const NS = 'dsh-sudo-approve'
     const PENDING_ENDPOINT = 'api/sudo-approve/pending'
     const RESPOND_ENDPOINT = 'api/sudo-approve/respond'
+    const CONFIG_ENDPOINT = 'api/sudo-approve/config'
     const POLL_MS = 1500
 
     const zh = {
@@ -27,6 +30,9 @@ window.__ModuleLoader__.load({
       password: '输入登录密码',
       approve: '允许并执行',
       reject: '拒绝',
+      reasonPlaceholder: '拒绝理由（可选，会转告智能体）',
+      confirmReject: '确认拒绝',
+      cancel: '取消',
       working: '处理中…',
       remembered: '已记住本次会话的密码，可直接允许',
       invalidPassword: '密码不正确，请重试。',
@@ -34,6 +40,28 @@ window.__ModuleLoader__.load({
       stale: '该请求已失效。',
       failed: '提交失败，请重试。',
       remainingHint: '剩余时间',
+      settingsLabel: 'sudo 授权',
+      settingsTitle: 'sudo 授权确认',
+      settingsDesc: '智能体执行 sudo 时在聊天框弹出确认面板。这里的设置保存后立即生效，只影响之后发起的请求。',
+      settingsEnabled: '启用拦截',
+      settingsEnabledHint: '关闭后不再拦截 sudo 调用：插件仍然加载，但直接放行。',
+      settingsRemember: '授权粒度',
+      settingsRememberHint: '每次输入密码更安全；“本会话记住”的密码只存在 Host 内存，会话结束或进程退出即清除。',
+      rememberNever: '每次输入密码',
+      rememberSession: '本会话记住',
+      settingsTimeout: '面板超时',
+      settingsTimeoutHint: '超过该秒数没有确认就拒绝执行。',
+      settingsPresence: '页面在线窗口',
+      settingsPresenceHint: '超过该秒数没有浏览器页面轮询，就认为页面已断开并直接拒绝。',
+      settingsRemote: '允许远程部署接收密码',
+      settingsRemoteHint: '开启后，通过非回环地址连接的浏览器也能提交密码；明文网络路径上有风险。',
+      settingsReset: '恢复默认',
+      settingsResetDone: '已恢复为安装时的默认设置',
+      settingsSaved: '已保存',
+      settingsSaving: '保存中…',
+      settingsSaveFailed: '保存失败，请重试。',
+      settingsLoadFailed: '读取配置失败，请刷新页面重试。',
+      unitSeconds: '秒',
     }
 
     const en = {
@@ -42,6 +70,9 @@ window.__ModuleLoader__.load({
       password: 'Enter your login password',
       approve: 'Allow and run',
       reject: 'Reject',
+      reasonPlaceholder: 'Rejection reason (optional, shared with the agent)',
+      confirmReject: 'Confirm reject',
+      cancel: 'Cancel',
       working: 'Working…',
       remembered: 'This session already remembers the password',
       invalidPassword: 'Wrong password. Try again.',
@@ -49,32 +80,90 @@ window.__ModuleLoader__.load({
       stale: 'This request is no longer pending.',
       failed: 'Could not submit. Try again.',
       remainingHint: 'time left',
+      settingsLabel: 'sudo approval',
+      settingsTitle: 'sudo approval',
+      settingsDesc: 'The composer turns into a confirmation panel whenever the agent runs sudo. Settings apply immediately to new requests.',
+      settingsEnabled: 'Intercept sudo',
+      settingsEnabledHint: 'When off, sudo calls pass through untouched while the plugin stays loaded.',
+      settingsRemember: 'Password scope',
+      settingsRememberHint: 'Asking every time is safer. A remembered password lives in Host memory only and dies with the session or process.',
+      rememberNever: 'Ask every time',
+      rememberSession: 'Remember for this session',
+      settingsTimeout: 'Panel timeout',
+      settingsTimeoutHint: 'An unanswered request is rejected after this many seconds.',
+      settingsPresence: 'Page presence window',
+      settingsPresenceHint: 'With no page poll for this many seconds, requests are rejected outright.',
+      settingsRemote: 'Accept passwords from remote deployments',
+      settingsRemoteHint: 'Lets a browser connected over a non-loopback address submit the password, which is risky on a plaintext path.',
+      settingsReset: 'Restore defaults',
+      settingsResetDone: 'Restored the install-time defaults',
+      settingsSaved: 'Saved',
+      settingsSaving: 'Saving…',
+      settingsSaveFailed: 'Could not save. Try again.',
+      settingsLoadFailed: 'Could not read the settings. Refresh the page and retry.',
+      unitSeconds: 's',
     }
 
     const CSS = `
-.dsa-panel{box-sizing:border-box;display:flex;flex-direction:column;gap:8px;padding:12px 14px;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-size:13px;line-height:1.55}
-.dsa-head{display:flex;align-items:center;gap:8px}
+.dsa-seat{box-sizing:border-box;display:flex;flex-direction:column;align-items:center;width:100%;padding:8px var(--dsh-composer-side-clearance,16px) 12px}
+.dsa-panel{box-sizing:border-box;display:flex;flex-direction:column;width:100%;max-width:var(--dsh-composer-card-max-width,min(calc(100% - 32px),952px));overflow:hidden;border:1px solid var(--dsw-alias-state-warn-secondary);border-radius:var(--dsw-radius-panel,28px);background:var(--dsw-specific-input-major,var(--dsw-alias-bg-layer-1));box-shadow:var(--dsw-elevation-soft);color:var(--dsw-alias-label-primary);font-size:13px;line-height:1.55}
+.dsa-strip{display:flex;align-items:center;gap:8px;padding:10px 18px;background:var(--dsw-alias-state-warn-tertiary);color:var(--dsw-alias-state-warn-primary);font-size:13px;line-height:20px}
 .dsa-lock{font-size:14px;line-height:1}
 .dsa-title{flex:1 1 auto;font-weight:600}
-.dsa-count{flex:0 0 auto;font-size:12px;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary)}
-.dsa-sub{font-size:12px;color:var(--dsw-alias-label-secondary)}
-.dsa-list{display:flex;flex-direction:column;gap:4px;max-height:220px;margin:0;padding:8px 10px;overflow:auto;border-radius:8px;background:var(--dsw-alias-bg-layer-2);list-style:none}
-.dsa-cmd{display:flex;gap:6px;align-items:flex-start;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.dsa-count{flex:0 0 auto;font-size:12px;font-variant-numeric:tabular-nums;opacity:.85}
+.dsa-body{display:flex;flex-direction:column;gap:10px;padding:14px 18px 4px}
+.dsa-sub{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
+.dsa-list{display:flex;flex-direction:column;gap:6px;max-height:200px;margin:0;padding:10px 12px;overflow:auto;border-radius:12px;background:var(--dsw-alias-bg-layer-2);list-style:none}
+.dsa-cmd{display:flex;gap:6px;align-items:flex-start;font-family:var(--ds-font-family-code,ui-monospace,SFMono-Regular,Menlo,Consolas,monospace);font-size:12px;line-height:20px}
 .dsa-prompt{flex:0 0 auto;color:var(--dsw-alias-label-secondary);user-select:none}
 .dsa-cmd-sudo .dsa-prompt{color:var(--dsw-alias-state-warn-primary)}
 .dsa-note .dsa-code{color:var(--dsw-alias-label-secondary);font-style:italic}
 .dsa-code{white-space:pre-wrap;word-break:break-word}
-.dsa-error{font-size:12px;color:var(--dsw-alias-state-error-primary)}
 .dsa-hint{font-size:12px;color:var(--dsw-alias-label-secondary)}
-.dsa-row{display:flex;gap:8px;align-items:center}
-.dsa-input{flex:1 1 auto;min-width:0;box-sizing:border-box;padding:7px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;outline:none}
+.dsa-error{font-size:12px;color:var(--dsw-alias-state-error-primary)}
+.dsa-actions{display:flex;align-items:center;gap:8px;padding:12px 18px 16px}
+.dsa-spacer{flex:1 1 auto}
+.dsa-input{box-sizing:border-box;padding:8px 12px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;outline:none}
 .dsa-input:focus{border-color:var(--dsw-alias-brand-primary)}
 .dsa-input:disabled{opacity:.6}
-.dsa-button{flex:0 0 auto;box-sizing:border-box;padding:7px 14px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;cursor:pointer}
+.dsa-password{flex:0 0 auto;width:240px}
+.dsa-reason{flex:1 1 auto;min-width:0}
+.dsa-button{flex:0 0 auto;box-sizing:border-box;padding:8px 16px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;cursor:pointer}
 .dsa-button:hover:enabled{background:var(--dsw-alias-bg-layer-2)}
 .dsa-button:disabled{opacity:.55;cursor:default}
+.dsa-danger:hover:enabled{background:var(--dsw-alias-interactive-bg-hover-danger,var(--dsw-alias-bg-layer-2));color:var(--dsw-alias-state-error-primary);border-color:transparent}
 .dsa-primary{border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
-.dsa-primary:hover:enabled{background:var(--dsw-alias-brand-primary);opacity:.9}
+.dsa-primary:hover:enabled{opacity:.9}
+`
+
+    const SETTINGS_CSS = `
+.dsa-set{display:flex;flex-direction:column;max-width:640px;padding:4px 0 28px;color:var(--dsw-alias-label-primary)}
+.dsa-set-head{margin-bottom:6px}
+.dsa-set-title{margin:0;font-size:16px;font-weight:600;line-height:24px}
+.dsa-set-desc{margin:4px 0 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
+.dsa-set-row{display:flex;align-items:flex-start;gap:16px;padding:14px 0;border-top:1px solid var(--dsw-alias-border-l1)}
+.dsa-set-head+.dsa-set-row{border-top:none}
+.dsa-set-main{flex:1 1 auto;min-width:0}
+.dsa-set-name{font-size:13px;line-height:20px}
+.dsa-set-hint{margin-top:2px;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary)}
+.dsa-set-control{display:flex;flex:0 0 auto;align-items:center;gap:6px;padding-top:1px}
+.dsa-switch{position:relative;box-sizing:border-box;width:38px;height:22px;padding:0;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;background:var(--dsw-alias-bg-layer-2);cursor:pointer;transition:background .15s,border-color .15s}
+.dsa-switch[aria-checked=true]{border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-brand-primary)}
+.dsa-switch:disabled{opacity:.55;cursor:default}
+.dsa-knob{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:var(--dsw-alias-bg-base);box-shadow:0 1px 2px #00000033;transition:transform .15s}
+.dsa-switch[aria-checked=true] .dsa-knob{transform:translateX(16px)}
+.dsa-seg{display:flex;overflow:hidden;border:1px solid var(--dsw-alias-border-l1);border-radius:10px}
+.dsa-seg button{box-sizing:border-box;padding:6px 12px;border:0;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer}
+.dsa-seg button[aria-pressed=true]{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.dsa-seg button:disabled{opacity:.55;cursor:default}
+.dsa-num{box-sizing:border-box;width:88px;padding:6px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;text-align:right}
+.dsa-num:focus{border-color:var(--dsw-alias-brand-primary);outline:none}
+.dsa-set-foot{display:flex;align-items:center;gap:12px;margin-top:18px;padding-top:14px;border-top:1px solid var(--dsw-alias-border-l1)}
+.dsa-set-status{flex:1 1 auto;min-width:0;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary);word-break:break-all}
+.dsa-set-status[data-error=true]{color:var(--dsw-alias-state-error-primary)}
+.dsa-link{box-sizing:border-box;padding:6px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer}
+.dsa-link:hover:enabled{background:var(--dsw-alias-bg-layer-2)}
+.dsa-link:disabled{opacity:.55;cursor:default}
 `
 
     /** Copy is bound in `apply`; the panel is created per page, so one binding is enough. */
@@ -105,8 +194,12 @@ window.__ModuleLoader__.load({
       const [password, setPassword] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState('')
+      const [rejecting, setRejecting] = React.useState(false)
+      const [reason, setReason] = React.useState('')
       const [remaining, setRemaining] = React.useState(() => Math.max(0, (snapshot.expiresAt || 0) - Date.now()))
-      const inputRef = React.useRef(null)
+      const passwordRef = React.useRef(null)
+      const reasonRef = React.useRef(null)
+      const composing = React.useRef(false)
 
       React.useEffect(() => {
         const tick = () => setRemaining(Math.max(0, (snapshot.expiresAt || 0) - Date.now()))
@@ -115,15 +208,24 @@ window.__ModuleLoader__.load({
         return () => window.clearInterval(timer)
       }, [snapshot.expiresAt])
 
+      // Focus follows the mode: the password field normally, the reason field
+      // once the user starts a rejection.
       React.useEffect(() => {
-        const node = inputRef.current
+        const node = rejecting ? reasonRef.current : passwordRef.current
         if (node === null || node === undefined) return
         try {
           node.focus()
         } catch {
           // focus is a convenience only
         }
-      }, [])
+      }, [rejecting])
+
+      const closeReject = () => {
+        if (busy) return
+        setRejecting(false)
+        setReason('')
+        setError('')
+      }
 
       const submit = async (decision) => {
         if (busy) return
@@ -131,7 +233,12 @@ window.__ModuleLoader__.load({
         setError('')
         try {
           const body = { id: pending.key, decision }
-          if (decision === 'approve' && password !== '') body.password = password
+          if (decision === 'approve') {
+            if (password !== '') body.password = password
+          } else {
+            const trimmed = reason.trim()
+            if (trimmed !== '') body.reason = trimmed
+          }
           const response = await fetch(RESPOND_ENDPOINT, {
             method: 'POST',
             credentials: 'same-origin',
@@ -141,6 +248,7 @@ window.__ModuleLoader__.load({
           const payload = await response.json().catch(() => undefined)
           if (payload && payload.ok === true) {
             setPassword('')
+            setReason('')
             return
           }
           const code = payload && payload.error ? payload.error.code : undefined
@@ -162,77 +270,344 @@ window.__ModuleLoader__.load({
       }
 
       const canApprove = !busy && (password !== '' || !passwordRequired)
+      const enterWithoutComposition = (event) =>
+        event.key === 'Enter' &&
+        composing.current === false &&
+        !(event.nativeEvent && event.nativeEvent.isComposing) &&
+        event.keyCode !== 229
 
       return h(
         'div',
-        {
-          className: 'dsa-panel',
-          role: 'group',
-          'aria-label': t('title'),
-          onKeyDown: (event) => {
-            if (event.key === 'Escape' && !busy) {
-              event.preventDefault()
-              submit('reject')
-            }
-          },
-        },
-        h('style', { dangerouslySetInnerHTML: { __html: CSS } }),
-        h('div', { className: 'dsa-head' }, [
-          h('span', { key: 'lock', className: 'dsa-lock', 'aria-hidden': true }, '🔒'),
-          h('span', { key: 'title', className: 'dsa-title' }, t('title')),
-          h('span', { key: 'count', className: 'dsa-count', title: t('remainingHint') }, formatClock(remaining)),
-        ]),
-        h('div', { className: 'dsa-sub' }, t('subtitle')),
+        { className: 'dsa-seat' },
         h(
-          'ul',
-          { className: 'dsa-list' },
-          items.map((item, index) =>
+          'div',
+          {
+            className: 'dsa-panel',
+            role: 'group',
+            'aria-label': t('title'),
+            onKeyDown: (event) => {
+              if (event.key !== 'Escape' || busy) return
+              event.preventDefault()
+              if (rejecting) closeReject()
+              else setRejecting(true)
+            },
+          },
+          h('style', { dangerouslySetInnerHTML: { __html: CSS } }),
+          h('div', { className: 'dsa-strip' }, [
+            h('span', { key: 'lock', className: 'dsa-lock', 'aria-hidden': true }, '🔒'),
+            h('span', { key: 'title', className: 'dsa-title' }, t('title')),
+            h('span', { key: 'count', className: 'dsa-count', title: t('remainingHint') }, formatClock(remaining)),
+          ]),
+          h('div', { className: 'dsa-body' }, [
+            h('div', { key: 'sub', className: 'dsa-sub' }, t('subtitle')),
             h(
-              'li',
+              'ul',
+              { key: 'list', className: 'dsa-list' },
+              items.map((item, index) =>
+                h(
+                  'li',
+                  {
+                    key: index,
+                    className: `dsa-cmd${item.sudo ? ' dsa-cmd-sudo' : ''}${item.note ? ' dsa-note' : ''}`,
+                  },
+                  h('span', { className: 'dsa-prompt', 'aria-hidden': true }, item.sudo ? '#' : '$'),
+                  h('code', { className: 'dsa-code' }, item.text),
+                ),
+              ),
+            ),
+            passwordRequired || rejecting ? null : h('div', { key: 'hint', className: 'dsa-hint' }, t('remembered')),
+            error === '' ? null : h('div', { key: 'error', className: 'dsa-error', role: 'alert' }, error),
+          ]),
+          rejecting
+            ? h('div', { className: 'dsa-actions' }, [
+                h('input', {
+                  key: 'reason',
+                  ref: reasonRef,
+                  className: 'dsa-input dsa-reason',
+                  type: 'text',
+                  value: reason,
+                  placeholder: t('reasonPlaceholder'),
+                  maxLength: 200,
+                  spellCheck: false,
+                  disabled: busy,
+                  onChange: (event) => setReason(event.target.value),
+                  onCompositionStart: () => {
+                    composing.current = true
+                  },
+                  onCompositionEnd: () => {
+                    composing.current = false
+                  },
+                  onKeyDown: (event) => {
+                    if (!enterWithoutComposition(event)) return
+                    event.preventDefault()
+                    submit('reject')
+                  },
+                }),
+                h('div', { key: 'spacer', className: 'dsa-spacer' }),
+                h(
+                  'button',
+                  { key: 'cancel', type: 'button', className: 'dsa-button', disabled: busy, onClick: closeReject },
+                  t('cancel'),
+                ),
+                h(
+                  'button',
+                  {
+                    key: 'confirm',
+                    type: 'button',
+                    className: 'dsa-button dsa-danger',
+                    disabled: busy,
+                    onClick: () => submit('reject'),
+                  },
+                  busy ? t('working') : t('confirmReject'),
+                ),
+              ])
+            : h('div', { className: 'dsa-actions' }, [
+                h('input', {
+                  key: 'password',
+                  ref: passwordRef,
+                  className: 'dsa-input dsa-password',
+                  type: 'password',
+                  value: password,
+                  placeholder: t('password'),
+                  autoComplete: 'current-password',
+                  spellCheck: false,
+                  disabled: busy,
+                  onChange: (event) => setPassword(event.target.value),
+                  onCompositionStart: () => {
+                    composing.current = true
+                  },
+                  onCompositionEnd: () => {
+                    composing.current = false
+                  },
+                  onKeyDown: (event) => {
+                    if (!enterWithoutComposition(event)) return
+                    event.preventDefault()
+                    if (canApprove) submit('approve')
+                  },
+                }),
+                h('div', { key: 'spacer', className: 'dsa-spacer' }),
+                h(
+                  'button',
+                  { key: 'reject', type: 'button', className: 'dsa-button', disabled: busy, onClick: () => setRejecting(true) },
+                  t('reject'),
+                ),
+                h(
+                  'button',
+                  {
+                    key: 'approve',
+                    type: 'button',
+                    className: 'dsa-button dsa-primary',
+                    disabled: !canApprove,
+                    onClick: () => submit('approve'),
+                  },
+                  busy ? t('working') : t('approve'),
+                ),
+              ]),
+        ),
+      )
+    }
+
+    /** Settings page: the same knobs as the Loader config, stored by the Host. */
+    function SettingsPanel() {
+      const [snapshot, setSnapshot] = React.useState(undefined)
+      const [status, setStatus] = React.useState('')
+      const [failed, setFailed] = React.useState(false)
+      const [busy, setBusy] = React.useState(false)
+
+      const load = React.useCallback(async () => {
+        try {
+          const response = await fetch(CONFIG_ENDPOINT, {
+            credentials: 'same-origin',
+            headers: { accept: 'application/json' },
+          })
+          const payload = await response.json().catch(() => undefined)
+          if (payload && payload.ok === true) {
+            setSnapshot(payload.value)
+            return
+          }
+        } catch {
+          // reported below
+        }
+        setFailed(true)
+        setStatus(t('settingsLoadFailed'))
+      }, [])
+
+      React.useEffect(() => {
+        load().catch(() => {})
+      }, [load])
+
+      const send = async (payload, note) => {
+        if (busy) return
+        setBusy(true)
+        setFailed(false)
+        setStatus(t('settingsSaving'))
+        try {
+          const response = await fetch(CONFIG_ENDPOINT, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(payload),
+          })
+          const body = await response.json().catch(() => undefined)
+          if (body && body.ok === true) {
+            setSnapshot(body.value)
+            setStatus(note)
+            return
+          }
+        } catch {
+          // reported below
+        }
+        setFailed(true)
+        setStatus(t('settingsSaveFailed'))
+      }
+
+      const values = (snapshot && snapshot.values) || {}
+      const limits = (snapshot && snapshot.limits) || { timeoutMs: [5000, 900000], presenceWindowMs: [2000, 300000] }
+      const ready = snapshot !== undefined
+      const disabled = !ready || busy
+
+      const commitSeconds = (raw, field, bounds) => {
+        const seconds = Number(raw)
+        if (!Number.isFinite(seconds) || seconds <= 0) return
+        const low = Math.ceil(bounds[0] / 1000)
+        const high = Math.floor(bounds[1] / 1000)
+        const next = Math.min(Math.max(Math.round(seconds), low), high)
+        if (next * 1000 === values[field]) return
+        send({ patch: { [field]: next * 1000 } }, t('settingsSaved'))
+      }
+
+      const row = (name, hint, control) => [
+        h('div', { key: 'main', className: 'dsa-set-main' }, [
+          h('div', { key: 'name', className: 'dsa-set-name' }, name),
+          hint === '' ? null : h('div', { key: 'hint', className: 'dsa-set-hint' }, hint),
+        ]),
+        h('div', { key: 'control', className: 'dsa-set-control' }, control),
+      ]
+
+      const switchRow = (key, name, hint, checked, onToggle) =>
+        h('div', { key, className: 'dsa-set-row' },
+          row(
+            name,
+            hint,
+            h(
+              'button',
               {
-                key: index,
-                className: `dsa-cmd${item.sudo ? ' dsa-cmd-sudo' : ''}${item.note ? ' dsa-note' : ''}`,
+                type: 'button',
+                role: 'switch',
+                className: 'dsa-switch',
+                'aria-checked': checked === true,
+                'aria-label': name,
+                disabled,
+                onClick: onToggle,
               },
-              h('span', { className: 'dsa-prompt', 'aria-hidden': true }, item.sudo ? '#' : '$'),
-              h('code', { className: 'dsa-code' }, item.text),
+              h('span', { className: 'dsa-knob' }),
             ),
           ),
+        )
+
+      const numberRow = (key, name, hint, field, bounds) =>
+        h('div', { key, className: 'dsa-set-row' },
+          row(name, hint, [
+            h('input', {
+              key: `value-${values[field]}`,
+              className: 'dsa-num',
+              type: 'number',
+              min: Math.ceil(bounds[0] / 1000),
+              max: Math.floor(bounds[1] / 1000),
+              defaultValue: ready ? Math.round(values[field] / 1000) : '',
+              disabled,
+              'aria-label': name,
+              onKeyDown: (event) => {
+                if (event.key !== 'Enter') return
+                event.currentTarget.blur()
+              },
+              onBlur: (event) => commitSeconds(event.target.value, field, bounds),
+            }),
+            h('span', { key: 'unit', className: 'dsa-set-hint' }, t('unitSeconds')),
+          ]),
+        )
+
+      const rememberRow = h('div', { key: 'remember', className: 'dsa-set-row' },
+        row(
+          t('settingsRemember'),
+          t('settingsRememberHint'),
+          h('div', { className: 'dsa-seg' }, [
+            h(
+              'button',
+              {
+                key: 'never',
+                type: 'button',
+                'aria-pressed': values.remember === 'never',
+                disabled,
+                onClick: () => send({ patch: { remember: 'never' } }, t('settingsSaved')),
+              },
+              t('rememberNever'),
+            ),
+            h(
+              'button',
+              {
+                key: 'session',
+                type: 'button',
+                'aria-pressed': values.remember === 'session',
+                disabled,
+                onClick: () => send({ patch: { remember: 'session' } }, t('settingsSaved')),
+              },
+              t('rememberSession'),
+            ),
+          ]),
         ),
-        passwordRequired ? null : h('div', { className: 'dsa-hint' }, t('remembered')),
-        error === '' ? null : h('div', { className: 'dsa-error', role: 'alert' }, error),
-        h('div', { className: 'dsa-row' }, [
-          h('input', {
-            key: 'password',
-            ref: inputRef,
-            className: 'dsa-input',
-            type: 'password',
-            value: password,
-            placeholder: t('password'),
-            autoComplete: 'current-password',
-            spellCheck: false,
-            disabled: busy,
-            onChange: (event) => setPassword(event.target.value),
-            onKeyDown: (event) => {
-              if (event.key !== 'Enter') return
-              event.preventDefault()
-              if (canApprove) submit('approve')
-            },
-          }),
-          h(
-            'button',
-            { key: 'reject', type: 'button', className: 'dsa-button', disabled: busy, onClick: () => submit('reject') },
-            t('reject'),
-          ),
+      )
+
+      const footer =
+        status !== ''
+          ? status
+          : ready
+            ? `build ${snapshot.build} · ${snapshot.store}`
+            : ''
+
+      return h(
+        'div',
+        { className: 'dsa-set' },
+        h('style', { dangerouslySetInnerHTML: { __html: SETTINGS_CSS } }),
+        h('div', { className: 'dsa-set-head' }, [
+          h('h2', { key: 'title', className: 'dsa-set-title' }, t('settingsTitle')),
+          h('p', { key: 'desc', className: 'dsa-set-desc' }, t('settingsDesc')),
+        ]),
+        switchRow(
+          'enabled',
+          t('settingsEnabled'),
+          t('settingsEnabledHint'),
+          values.enabled,
+          () => send({ patch: { enabled: !values.enabled } }, t('settingsSaved')),
+        ),
+        rememberRow,
+        numberRow('timeout', t('settingsTimeout'), t('settingsTimeoutHint'), 'timeoutMs', limits.timeoutMs),
+        numberRow(
+          'presence',
+          t('settingsPresence'),
+          t('settingsPresenceHint'),
+          'presenceWindowMs',
+          limits.presenceWindowMs,
+        ),
+        switchRow(
+          'remote',
+          t('settingsRemote'),
+          t('settingsRemoteHint'),
+          values.allowRemoteDeployment,
+          () => send({ patch: { allowRemoteDeployment: !values.allowRemoteDeployment } }, t('settingsSaved')),
+        ),
+        h('div', { className: 'dsa-set-foot' }, [
+          h('div', { key: 'status', className: 'dsa-set-status', 'data-error': failed, title: footer }, footer),
           h(
             'button',
             {
-              key: 'approve',
+              key: 'reset',
               type: 'button',
-              className: 'dsa-button dsa-primary',
-              disabled: !canApprove,
-              onClick: () => submit('approve'),
+              className: 'dsa-link',
+              disabled,
+              onClick: () => send({ reset: true }, t('settingsResetDone')),
             },
-            busy ? t('working') : t('approve'),
+            t('settingsReset'),
           ),
         ]),
       )
@@ -308,6 +683,18 @@ window.__ModuleLoader__.load({
             select: ({ pendingInteraction }) => (pendingInteraction instanceof PendingSudo ? pendingInteraction : null),
           },
           SudoPanel,
+        ),
+      )
+
+      ctx.slots.inject('settings.section', () =>
+        ctx.slots.register(
+          {
+            name: 'settings.section',
+            id: 'sudo-approve',
+            order: 40,
+            label: () => t('settingsLabel'),
+          },
+          SettingsPanel,
         ),
       )
     }

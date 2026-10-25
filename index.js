@@ -19,15 +19,15 @@
 
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, mkdirSync, rmSync, statSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 4
+const BUILD = 6
 /** Exact Fetch routes the browser half calls. */
 const ROUTE_PREFIX = '/api/sudo-approve'
 /** Fallback PATH when the Host process has none. */
@@ -81,7 +81,7 @@ const MESSAGES = Object.freeze({
   remote: 'sudo 审批：本部署接受非回环地址的浏览器连接，插件拒绝在明文网络路径上接收密码（配置项 allowRemoteDeployment=false），已拒绝执行。',
   noClient: 'sudo 审批：当前没有已连接的浏览器页面可以弹出确认面板，已拒绝执行。请在页面打开后重试。',
   busy: 'sudo 审批：另一个 sudo 请求正在等待确认，同一时间只处理一个，已拒绝执行。',
-  rejected: 'sudo 审批：用户拒绝执行该 sudo 命令。',
+  rejected: (reason) => (reason === undefined || reason === '' ? 'sudo 审批：用户拒绝执行该 sudo 命令。' : `sudo 审批：用户拒绝执行该 sudo 命令。拒绝理由：${reason}`),
   timeout: (seconds) => `sudo 审批：${seconds} 秒内没有收到确认，已拒绝执行。`,
   invalidPassword: 'sudo 审批：密码校验未通过。',
   internal: (detail) => `sudo 审批插件内部错误，已拒绝执行：${detail}`,
@@ -95,6 +95,31 @@ function isPlainObject(value) {
 /** Compact error text for logs and tool results. */
 function errorText(error) {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** One-line rejection reason; control characters folded, length capped. */
+function normalizeReason(value) {
+  if (typeof value !== 'string') return undefined
+  const text = value
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (text === '') return undefined
+  return text.length > 200 ? `${text.slice(0, 200)}…` : text
+}
+
+/** Keep only well-typed editable settings; ranges are clamped when resolved. */
+function sanitizePatch(raw) {
+  const patch = {}
+  if (!isPlainObject(raw)) return patch
+  if (typeof raw.enabled === 'boolean') patch.enabled = raw.enabled
+  if (raw.remember === 'never' || raw.remember === 'session') patch.remember = raw.remember
+  if (typeof raw.timeoutMs === 'number' && Number.isFinite(raw.timeoutMs)) patch.timeoutMs = Math.round(raw.timeoutMs)
+  if (typeof raw.presenceWindowMs === 'number' && Number.isFinite(raw.presenceWindowMs)) {
+    patch.presenceWindowMs = Math.round(raw.presenceWindowMs)
+  }
+  if (typeof raw.allowRemoteDeployment === 'boolean') patch.allowRemoteDeployment = raw.allowRemoteDeployment
+  return patch
 }
 
 /**
@@ -190,7 +215,24 @@ function findExecutable(name, searchPath) {
  * @param rawConfig - the Loader entry `config`.
  */
 export function apply(ctx, rawConfig) {
-  const config = resolveConfig(rawConfig)
+  const installConfig = isPlainObject(rawConfig) ? rawConfig : {}
+  const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  const storePath = join(home, `${NAME}.json`)
+  const auditLog = join(home, 'logs', `${NAME}.log`)
+
+  /** Saved settings, when the file reads back as editable values. */
+  function readStoredOverrides() {
+    try {
+      const parsed = JSON.parse(readFileSync(storePath, 'utf8'))
+      return isPlainObject(parsed) ? sanitizePatch(parsed) : {}
+    } catch {
+      return {}
+    }
+  }
+
+  let overrides = readStoredOverrides()
+  /** Live config: install-time values under the saved settings. */
+  let config = resolveConfig({ ...installConfig, ...overrides })
   const basePath = process.env.PATH ?? FALLBACK_PATH
   const baseAskpass = process.env.SUDO_ASKPASS
   const realSudo = findExecutable('sudo', basePath)
@@ -199,10 +241,8 @@ export function apply(ctx, rawConfig) {
   /** Append one sanitized audit line; never receives a password. */
   function audit(event) {
     try {
-      const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
-      const dir = join(home, 'logs')
-      mkdirSync(dir, { recursive: true })
-      appendFileSync(join(dir, `${NAME}.log`), `${JSON.stringify({ time: new Date().toISOString(), ...event })}\n`, {
+      mkdirSync(dirname(auditLog), { recursive: true })
+      appendFileSync(auditLog, `${JSON.stringify({ time: new Date().toISOString(), ...event })}\n`, {
         mode: 0o600,
       })
     } catch {
@@ -227,6 +267,51 @@ export function apply(ctx, rawConfig) {
   const installed = new Set()
 
   audit({ event: 'loaded', build: BUILD, remember: config.remember, timeoutMs: config.timeoutMs, sudo: realSudo })
+
+  // ---------------------------------------------------------- settings ----
+  /** Recompute live config, dropping remembered secrets that no longer apply. */
+  function applyOverrides(next) {
+    overrides = next
+    config = resolveConfig({ ...installConfig, ...overrides })
+    if (config.remember !== 'session') remembered.clear()
+  }
+
+  /** Persist a validated patch and apply it to new requests immediately. */
+  function saveOverrides(patch) {
+    const next = { ...overrides, ...patch }
+    mkdirSync(dirname(storePath), { recursive: true })
+    writeFileSync(storePath, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
+    applyOverrides(next)
+  }
+
+  /** Drop every saved value, back to the install-time config. */
+  function resetOverrides() {
+    try {
+      rmSync(storePath, { force: true })
+    } catch {
+      // best effort
+    }
+    applyOverrides({})
+  }
+
+  /** Values and bounds the settings page renders. */
+  function settingsSnapshot() {
+    return {
+      build: BUILD,
+      store: storePath,
+      auditLog,
+      limits: { timeoutMs: LIMITS.timeoutMs, presenceWindowMs: LIMITS.presenceWindowMs },
+      values: {
+        enabled: config.enabled,
+        remember: config.remember,
+        timeoutMs: config.timeoutMs,
+        presenceWindowMs: config.presenceWindowMs,
+        allowRemoteDeployment: config.allowRemoteDeployment,
+      },
+      install: sanitizePatch(installConfig),
+      overrides: { ...overrides },
+    }
+  }
 
   // ------------------------------------------------------------- env ------
   /** Put the PATH shim and askpass helper in front of the inherited env. */
@@ -438,8 +523,8 @@ export function apply(ctx, rawConfig) {
       return undefined
     }
     if (decision.kind === 'rejected') {
-      audit({ event: 'rejected', id: request.id, sessionId: request.sessionId })
-      return { kind: 'deny', reason: MESSAGES.rejected }
+      audit({ event: 'rejected', id: request.id, sessionId: request.sessionId, reason: decision.reason })
+      return { kind: 'deny', reason: MESSAGES.rejected(decision.reason) }
     }
     if (decision.kind === 'cancelled') {
       audit({ event: 'cancelled', id: request.id, sessionId: request.sessionId })
@@ -520,7 +605,7 @@ export function apply(ctx, rawConfig) {
       return respondJson({ ok: false, error: { code: 'sudo-approve/busy', message: 'this request is being resolved' } }, 409)
     }
     if (decision === 'reject') {
-      request.settle?.({ kind: 'rejected' })
+      request.settle?.({ kind: 'rejected', reason: normalizeReason(body?.reason) })
       return respondJson({ ok: true, value: { state: 'rejected' } })
     }
     request.resolving = true
@@ -571,6 +656,38 @@ export function apply(ctx, rawConfig) {
             return respondJson({ ok: false, error: { code: 'sudo-approve/bad-request', message: 'body is not JSON' } }, 400)
           }
           return respond(body)
+        },
+      })
+      connection.fetch.register({
+        path: `${ROUTE_PREFIX}/config`,
+        methods: ['GET', 'POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          // Deliberately does not refresh the presence window: a settings page
+          // is not an approval surface.
+          if (request.method !== 'POST') return respondJson({ ok: true, value: settingsSnapshot() })
+          let body
+          try {
+            body = await request.json()
+          } catch {
+            return respondJson({ ok: false, error: { code: 'sudo-approve/bad-request', message: 'body is not JSON' } }, 400)
+          }
+          if (body?.reset === true) {
+            resetOverrides()
+            audit({ event: 'configured', reset: true })
+            return respondJson({ ok: true, value: settingsSnapshot() })
+          }
+          const patch = sanitizePatch(body?.patch)
+          if (Object.keys(patch).length === 0) {
+            return respondJson({ ok: false, error: { code: 'sudo-approve/bad-request', message: 'no editable setting' } }, 400)
+          }
+          try {
+            saveOverrides(patch)
+          } catch (error) {
+            return respondJson({ ok: false, error: { code: 'sudo-approve/store-failed', message: errorText(error) } }, 500)
+          }
+          audit({ event: 'configured', ...patch })
+          return respondJson({ ok: true, value: settingsSnapshot() })
         },
       })
     })
