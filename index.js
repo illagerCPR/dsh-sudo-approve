@@ -27,7 +27,7 @@ import { join } from 'node:path'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 3
+const BUILD = 4
 /** Exact Fetch routes the browser half calls. */
 const ROUTE_PREFIX = '/api/sudo-approve'
 /** Fallback PATH when the Host process has none. */
@@ -288,6 +288,11 @@ export function apply(ctx, rawConfig) {
 
   /**
    * Validate a password with one non-interactive `sudo -S -v` attempt.
+   *
+   * `-k` matters: `sudo -v` honours the timestamp cache, so within 15 minutes of
+   * any earlier successful sudo it exits 0 without ever looking at the password.
+   * Invalidating first forces a real PAM authentication, so a wrong password can
+   * never be accepted just because a timestamp happened to be warm.
    * @param secret - the candidate password.
    * @returns whether sudo accepted it.
    */
@@ -302,7 +307,7 @@ export function apply(ctx, rawConfig) {
       }
       let child
       try {
-        child = spawn(realSudo, ['-S', '-v'], {
+        child = spawn(realSudo, ['-k', '-S', '-v'], {
           stdio: ['pipe', 'ignore', 'ignore'],
           env: {
             PATH: basePath,
