@@ -1,0 +1,6 @@
+# meow-memory 项目记忆库（本地数据，不入库）
+.dsh-meow/
+
+# 依赖与产物
+node_modules/
+*.log

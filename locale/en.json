@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "sudo approval",
+    "description": "Takes over the composer when the agent runs sudo: lists the commands and asks for a password before anything runs."
+  }
+}

@@ -1,0 +1,9 @@
+- insert:
+    - id: sudo-approve
+      name: dsh-sudo-approve
+      config:
+        enabled: true
+        remember: never
+        timeoutMs: 120000
+        presenceWindowMs: 15000
+        allowRemoteDeployment: false

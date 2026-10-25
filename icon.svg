@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="sudo approval">
+  <rect width="64" height="64" rx="14" fill="#247bbf"/>
+  <path d="M17 21l10 10-10 10" fill="none" stroke="#ffffff" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>
+  <rect x="31" y="39" width="26" height="17" rx="5" fill="#ffffff"/>
+  <path d="M36.5 39v-4.6a7.5 7.5 0 0 1 15 0V39" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="44" cy="47.5" r="2.6" fill="#247bbf"/>
+</svg>
