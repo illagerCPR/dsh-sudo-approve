@@ -27,7 +27,7 @@ import { dirname, join } from 'node:path'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 7
+const BUILD = 8
 /** Exact Fetch routes the browser half calls. */
 const ROUTE_PREFIX = '/api/sudo-approve'
 /** Fallback PATH when the Host process has none. */
@@ -38,7 +38,9 @@ const LIMITS = { timeoutMs: [5_000, 900_000], presenceWindowMs: [2_000, 300_000]
 /**
  * Generated `sudo` shim. It exists only while an approved command runs and only
  * adds `-A`; forms that sudo-rs refuses to combine with `-A` (`-k`, `-V`, `-h`)
- * are forwarded untouched.
+ * are forwarded untouched. The askpass helper travels in the shim's own
+ * environment instead of the Host's, so concurrent installs cannot take the
+ * password source away from each other.
  */
 const SUDO_SHIM = `#!/bin/sh
 for arg do
@@ -47,8 +49,19 @@ for arg do
       exec "@SUDO@" "$@" ;;
   esac
 done
-exec "@SUDO@" -A "$@"
+SUDO_ASKPASS="@ASKPASS@" exec "@SUDO@" -A "$@"
 `
+
+/** The PTC presentation transport; a sub-dispatch carries its token as `parent`. */
+const RUN_CODE_NAME = 'run_code'
+
+/**
+ * Time a nested request leaves untouched at the end of its program budget, so
+ * validation and the command itself still fit after the panel closes.
+ */
+const PTC_RESERVE_MS = 10_000
+/** Shortest wait a nested request will open the panel for. */
+const MIN_PANEL_MS = 5_000
 
 /** Defaults; a `cordis.patch.yml` `config` object overrides them. */
 const DEFAULTS = Object.freeze({
@@ -76,11 +89,11 @@ const MESSAGES = Object.freeze({
   noAgent: 'sudo 审批：无法确定发起该调用的智能体会话，已拒绝执行。',
   subagent: 'sudo 审批：子智能体不能申请 sudo，只有主会话可以直接执行 sudo 命令。请让主会话运行该命令。',
   background: 'sudo 审批：不支持 run_in_background 的 sudo 调用，请改为前台执行（需要你在按钮上确认）。',
-  nested: 'sudo 审批：不支持在嵌套工具调用中执行 sudo。',
   sandbox: (mode) => `sudo 审批：当前会话处于 ${mode} 沙箱，沙箱内无法获取 root。请先把会话权限切换到 danger-full-access 再重试。`,
   remote: 'sudo 审批：本部署接受非回环地址的浏览器连接，插件拒绝在明文网络路径上接收密码（配置项 allowRemoteDeployment=false），已拒绝执行。',
   noClient: 'sudo 审批：当前没有已连接的浏览器页面可以弹出确认面板，已拒绝执行。请在页面打开后重试。',
-  busy: 'sudo 审批：另一个 sudo 请求正在等待确认，同一时间只处理一个，已拒绝执行。',
+  busy: 'sudo 审批：另一个 sudo 请求正在等待确认，同一时间只处理一个，已拒绝执行。请等这笔结清后再发下一笔（并行发起的 sudo 只会有第一笔被处理）。',
+  budget: (seconds) => `sudo 审批：所处 run_code 程序的 ${seconds} 秒执行预算已不足以完成确认，已拒绝执行。请把 sudo 调用放到程序开头，或单独放进一个简短的程序重试（并行发起的 sudo 请改为串行）。`,
   rejected: (reason) => (reason === undefined || reason === '' ? 'sudo 审批：用户拒绝执行该 sudo 命令。' : `sudo 审批：用户拒绝执行该 sudo 命令。拒绝理由：${reason}`),
   timeout: (seconds) => `sudo 审批：${seconds} 秒内没有收到确认，已拒绝执行。`,
   invalidPassword: 'sudo 审批：密码校验未通过。',
@@ -236,7 +249,6 @@ export function apply(ctx, rawConfig) {
   /** Live config: install-time values under the saved settings. */
   let config = resolveConfig({ ...installConfig, ...overrides })
   const basePath = process.env.PATH ?? FALLBACK_PATH
-  const baseAskpass = process.env.SUDO_ASKPASS
   const realSudo = findExecutable('sudo', basePath)
   const realSudoedit = findExecutable('sudoedit', basePath)
 
@@ -265,8 +277,19 @@ export function apply(ctx, rawConfig) {
   const remembered = new Map()
   /** Timestamp of the last page poll; 0 means no page has ever polled. */
   let lastPollAt = 0
-  /** Shim directories that must disappear on unload. */
-  const installed = new Set()
+  /**
+   * Live shim installs, newest first. Several approved commands may run at the
+   * same time — parallel native calls, concurrent PTC sub-calls — so each
+   * install keeps its own directory, its own shim and its own askpass helper,
+   * and PATH lists every live one instead of being overwritten by the last.
+   */
+  const shims = []
+  /**
+   * `run_code` token → the moment its dispatch started. A program's elapsed
+   * budget is fixed at that point, so this is what lets a nested request size
+   * its panel inside the time that is actually left.
+   */
+  const ptcParents = new Map()
 
   audit({ event: 'loaded', build: BUILD, remember: config.remember, timeoutMs: config.timeoutMs, sudo: realSudo })
 
@@ -316,10 +339,16 @@ export function apply(ctx, rawConfig) {
   }
 
   // ------------------------------------------------------------- env ------
-  /** Put the PATH shim and askpass helper in front of the inherited env. */
+  /** Rebuild PATH from the live shim directories over the inherited PATH. */
+  function syncPath() {
+    const dirs = shims.map((run) => run.bin).filter((bin) => typeof bin === 'string')
+    process.env.PATH = dirs.length === 0 ? basePath : `${basePath === '' ? '' : `${dirs.join(':')}:`}${basePath}`
+  }
+
+  /** Put one PATH shim and askpass helper in front of the inherited env. */
   async function materialize(secret) {
     const root = await mkdtemp(join(process.env.XDG_RUNTIME_DIR || tmpdir(), `${NAME}-`))
-    installed.add(root)
+    const run = { root }
     try {
       await chmod(root, 0o700)
       const bin = join(root, 'bin')
@@ -330,47 +359,46 @@ export function apply(ctx, rawConfig) {
       const askpass = join(root, 'askpass.sh')
       await writeFile(askpass, `#!/bin/sh\nexec cat "${passwordFile}"\n`, { mode: 0o700 })
       await chmod(askpass, 0o700)
-      await writeFile(join(bin, 'sudo'), SUDO_SHIM.replaceAll('@SUDO@', realSudo), { mode: 0o700 })
+      const shim = (target) => SUDO_SHIM.replaceAll('@SUDO@', target).replaceAll('@ASKPASS@', askpass)
+      await writeFile(join(bin, 'sudo'), shim(realSudo), { mode: 0o700 })
       await chmod(join(bin, 'sudo'), 0o700)
       if (realSudoedit !== undefined) {
-        await writeFile(join(bin, 'sudoedit'), SUDO_SHIM.replaceAll('@SUDO@', realSudoedit), { mode: 0o700 })
+        await writeFile(join(bin, 'sudoedit'), shim(realSudoedit), { mode: 0o700 })
         await chmod(join(bin, 'sudoedit'), 0o700)
       }
-      process.env.PATH = `${bin}:${basePath}`
-      process.env.SUDO_ASKPASS = askpass
-      return { root, bin, askpass }
+      run.bin = bin
+      run.askpass = askpass
+      shims.unshift(run)
+      syncPath()
+      return run
     } catch (error) {
-      await dematerialize({ root })
+      await dematerialize(run)
       throw error
     }
   }
 
-  /** Restore the inherited env and delete the shim directory. */
+  /** Drop one shim from PATH and delete its directory, leaving the others live. */
   async function dematerialize(run) {
-    if (run?.bin !== undefined && process.env.PATH === `${run.bin}:${basePath}`) process.env.PATH = basePath
-    if (baseAskpass === undefined) {
-      if (run?.askpass !== undefined && process.env.SUDO_ASKPASS === run.askpass) delete process.env.SUDO_ASKPASS
-    } else if (run?.askpass !== undefined && process.env.SUDO_ASKPASS === run.askpass) {
-      process.env.SUDO_ASKPASS = baseAskpass
+    const index = run === undefined ? -1 : shims.indexOf(run)
+    if (index >= 0) {
+      shims.splice(index, 1)
+      syncPath()
     }
     if (run?.root === undefined) return
-    installed.delete(run.root)
     await rm(run.root, { recursive: true, force: true }).catch(() => {})
   }
 
   /** Synchronous last-resort cleanup for process exit and plugin unload. */
   function hardCleanup() {
-    process.env.PATH = basePath
-    if (baseAskpass === undefined) delete process.env.SUDO_ASKPASS
-    else process.env.SUDO_ASKPASS = baseAskpass
-    for (const root of installed) {
+    const runs = shims.splice(0, shims.length)
+    syncPath()
+    for (const run of runs) {
       try {
-        rmSync(root, { recursive: true, force: true })
+        rmSync(run.root, { recursive: true, force: true })
       } catch {
         // ignore
       }
     }
-    installed.clear()
   }
 
   /**
@@ -446,8 +474,50 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /** Whether this agent's model reaches tools through `run_code` (PTC presentation). */
+  function presentsPtc(agent) {
+    const tools = ctx.get('tools')
+    if (tools === undefined || typeof tools.get !== 'function') return false
+    try {
+      // The transport is visible only to scopes whose mode actually presents it.
+      return tools.get(RUN_CODE_NAME, agent) !== undefined
+    } catch {
+      return false
+    }
+  }
+
+  /** The elapsed budget a `run_code` program runs with, when one is mounted. */
+  function ptcBudgetMs() {
+    try {
+      const timeout = ctx.get('ptcRuntime')?.timeout
+      return typeof timeout?.defaultMs === 'number' && timeout.defaultMs > 0 ? timeout.defaultMs : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Size the wait of a nested (PTC) request inside what is left of its program.
+   *
+   * A `run_code` program's elapsed budget covers the approval wait and was fixed
+   * when the program started. Waiting longer than the budget would kill the
+   * program while the user is still typing, so the panel closes before that, and
+   * a request with too little left is refused up front instead of opening a
+   * panel nobody can finish in time.
+   * @param exec - the nested call.
+   * @returns the wait to use, or the reason to refuse it.
+   */
+  function nestedWait(exec) {
+    const budget = ptcBudgetMs()
+    if (budget === undefined) return { waitMs: config.timeoutMs }
+    const startedAt = ptcParents.get(exec.parent)
+    const left = budget - (startedAt === undefined ? 0 : Date.now() - startedAt) - PTC_RESERVE_MS
+    if (left < MIN_PANEL_MS) return { deny: MESSAGES.budget(Math.round(budget / 1000)) }
+    return { waitMs: Math.min(config.timeoutMs, Math.floor(left)) }
+  }
+
   /** Ask the page and resolve the whole gate for one sudo command. */
-  async function askForApproval(exec, analysis) {
+  async function askForApproval(exec, analysis, waitMs) {
     let session
     let cwd
     try {
@@ -461,14 +531,23 @@ export function apply(ctx, rawConfig) {
       callId: exec.callId,
       sessionId: exec.agent.id,
       createdAt: Date.now(),
-      expiresAt: Date.now() + config.timeoutMs,
+      expiresAt: Date.now() + waitMs,
       cwd,
       items: analysis.items,
       settle: undefined,
       resolving: false,
     }
     inflight = request
-    audit({ event: 'request', id: request.id, sessionId: request.sessionId, callId: request.callId, lines: analysis.items.length, cwd })
+    audit({
+      event: 'request',
+      id: request.id,
+      sessionId: request.sessionId,
+      callId: request.callId,
+      lines: analysis.items.length,
+      waitMs,
+      ...(exec.parent === undefined ? {} : { channel: 'ptc' }),
+      cwd,
+    })
     const decision = await new Promise((resolve) => {
       let finished = false
       const finish = (value) => {
@@ -478,7 +557,7 @@ export function apply(ctx, rawConfig) {
         exec.signal?.removeEventListener('abort', onAbort)
         resolve(value)
       }
-      const timer = setTimeout(() => finish({ kind: 'timeout' }), config.timeoutMs)
+      const timer = setTimeout(() => finish({ kind: 'timeout' }), waitMs)
       const onAbort = () => finish({ kind: 'cancelled' })
       request.settle = finish
       if (exec.signal?.aborted === true) {
@@ -495,7 +574,6 @@ export function apply(ctx, rawConfig) {
   /** Decide one sudo-bearing bash call. */
   async function decide(exec, analysis) {
     if (exec.agent === undefined) return { kind: 'deny', reason: MESSAGES.noAgent }
-    if (exec.parent !== undefined) return { kind: 'deny', reason: MESSAGES.nested }
     if (isPlainObject(exec.arguments) && exec.arguments.run_in_background === true) {
       return { kind: 'deny', reason: MESSAGES.background }
     }
@@ -518,7 +596,20 @@ export function apply(ctx, rawConfig) {
       return { kind: 'deny', reason: MESSAGES.noClient }
     }
 
-    const { request, decision } = await askForApproval(exec, analysis)
+    // A PTC sub-dispatch is how that presentation reaches any tool, so it is a
+    // normal path rather than a nested bypass: the password is still required.
+    // What differs is the wait, which has to fit inside the program's budget.
+    let waitMs = config.timeoutMs
+    if (exec.parent !== undefined) {
+      const nested = nestedWait(exec)
+      if (nested.deny !== undefined) {
+        audit({ event: 'denied', reason: 'ptc-budget', sessionId: exec.agent.id, callId: exec.callId })
+        return { kind: 'deny', reason: nested.deny }
+      }
+      waitMs = nested.waitMs
+    }
+
+    const { request, decision } = await askForApproval(exec, analysis, waitMs)
     if (decision.kind === 'approved' && typeof decision.secret === 'string' && decision.secret !== '') {
       armed.set(exec.callId, { secret: decision.secret, at: Date.now() })
       audit({ event: 'approved', id: request.id, sessionId: request.sessionId, callId: request.callId })
@@ -533,7 +624,7 @@ export function apply(ctx, rawConfig) {
       return { kind: 'cancel' }
     }
     audit({ event: 'timeout', id: request.id, sessionId: request.sessionId })
-    return { kind: 'deny', reason: MESSAGES.timeout(Math.round(config.timeoutMs / 1000)) }
+    return { kind: 'deny', reason: MESSAGES.timeout(Math.round(waitMs / 1000)) }
   }
 
   /** Gate one tool call; returns a decision or undefined to dispatch. */
@@ -561,7 +652,7 @@ export function apply(ctx, rawConfig) {
 
   // ----------------------------------------------------------- context ----
   /**
-   * One runtime-context paragraph: sudo exists here, the asking happens in the
+   * The runtime-context paragraph: sudo exists here, the asking happens in the
    * GUI, so the model should write plain sudo instead of trying to
    * authenticate by itself.
    */
@@ -569,8 +660,22 @@ export function apply(ctx, rawConfig) {
     '`sudo` is available here: a foreground `bash` call that invokes `sudo` or `sudoedit` shows the user the command in the GUI and asks for their password before it runs.',
     'Write it plainly (`sudo <command>`) — the approved call authenticates by itself, so never pass a password, pipe one in, or add `-n`/`-S`/askpass flags; `sudo -n` always fails here.',
     'One approval covers the whole command string, so keep sudo lines few and short. A rejection may quote the user\u2019s reason: do not retry the same command unchanged.',
-    '`sudo -k`, `-K`, `-V` and `-h` alone need no approval; sudo is unavailable in subagents and background jobs.',
+    'Only one approval is open at a time: sudo calls must be sequential, never parallel. `sudo -k`, `-K`, `-V` and `-h` alone need no approval; sudo is unavailable in subagents and background jobs.',
   ].join(' ')
+
+  /**
+   * The extra paragraph for a PTC presentation, where reaching `bash` costs a
+   * nested sub-dispatch and the approval wait is charged to the program budget.
+   * @returns the paragraph for this deployment.
+   */
+  function ptcContext() {
+    const budget = ptcBudgetMs()
+    const span = budget === undefined ? 'a fixed elapsed budget' : `a ${Math.round(budget / 1000)} second elapsed budget`
+    return [
+      'Tools here are reached through `run_code`, so run sudo inside the program: `await tools.bash({ command: \'sudo <command>\' })`. The GUI shows the approval panel while the program waits.',
+      `That wait, and the command itself, are charged to the program\u2019s ${span}, so put the sudo call near the start of a short program; a request whose program has too little time left is refused before any panel opens, and the answer is to rerun that sudo call in its own small program.`,
+    ].join(' ')
+  }
 
   ctx.effect(() => {
     const scope = ctx.inject(['systemPrompt'], (child) => {
@@ -588,7 +693,7 @@ export function apply(ctx, rawConfig) {
           if (!isRootAgent(agent)) return ''
           const mode = sandboxModeOf(agent)
           if (mode !== undefined && mode !== 'danger-full-access') return ''
-          return SUDO_CONTEXT
+          return presentsPtc(agent) ? `${ptcContext()} ${SUDO_CONTEXT}` : SUDO_CONTEXT
         },
       })
     })
@@ -599,6 +704,16 @@ export function apply(ctx, rawConfig) {
 
   // ----------------------------------------------------------- execute ----
   ctx.on('tools/execute', async (exec, next) => {
+    // Time a PTC program from the moment its dispatch starts: its budget is
+    // fixed here, and a nested sudo request later needs what is left of it.
+    if (exec.name === RUN_CODE_NAME && exec.parent === undefined) {
+      ptcParents.set(exec.token, Date.now())
+      try {
+        return await next()
+      } finally {
+        ptcParents.delete(exec.token)
+      }
+    }
     const entry = armed.get(exec.callId)
     if (entry === undefined) return next()
     armed.delete(exec.callId)
@@ -761,6 +876,7 @@ export function apply(ctx, rawConfig) {
       inflight = undefined
       armed.clear()
       remembered.clear()
+      ptcParents.clear()
     }
   }, `${NAME}: lifecycle`)
 }
