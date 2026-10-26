@@ -41,6 +41,8 @@ window.__ModuleLoader__.load({
       failed: '提交失败，请重试。',
       remainingHint: '剩余时间',
       queueHint: '另有 {count} 笔排队',
+      otherSession: '其他会话有 {count} 笔 sudo 待确认',
+      jump: '切过去',
       collapse: '折叠',
       expand: '展开',
       settingsLabel: 'sudo 授权',
@@ -84,6 +86,8 @@ window.__ModuleLoader__.load({
       failed: 'Could not submit. Try again.',
       remainingHint: 'time left',
       queueHint: '{count} more waiting',
+      otherSession: '{count} sudo approval waiting in another session',
+      jump: 'Open',
       collapse: 'Collapse',
       expand: 'Expand',
       settingsLabel: 'sudo approval',
@@ -117,7 +121,12 @@ window.__ModuleLoader__.load({
 .dsa-lock{font-size:14px;line-height:1}
 .dsa-title{flex:1 1 auto;font-weight:600}
 .dsa-count{flex:0 0 auto;font-size:12px;font-variant-numeric:tabular-nums;opacity:.85}
-.dsa-queue{flex:0 0 auto;font-size:12px;padding:1px 8px;border-radius:999px;background:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-state-warn-tertiary);opacity:.9;white-space:nowrap}
+.dsa-queue{flex:0 0 auto;font-size:12px;line-height:18px;padding:0 8px;border-radius:999px;white-space:nowrap;font-weight:600;color:inherit;background:transparent;border:1px solid currentColor;background:color-mix(in srgb,currentColor 14%,transparent);border-color:color-mix(in srgb,currentColor 38%,transparent)}
+.dsa-dock{display:inline-flex;align-items:center;gap:8px;padding:4px 10px;border-radius:999px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1)}
+.dsa-dock-dot{width:6px;height:6px;flex:0 0 auto;border-radius:999px;background:var(--dsw-alias-state-warn-primary)}
+.dsa-dock-text{white-space:nowrap}
+.dsa-dock-jump{padding:0 6px;border:0;border-radius:6px;font:inherit;font-weight:600;cursor:pointer;color:var(--dsw-alias-brand-primary);background:transparent}
+.dsa-dock-jump:hover{text-decoration:underline}
 .dsa-toggle{flex:0 0 auto;display:grid;place-items:center;box-sizing:border-box;width:22px;height:22px;padding:0;border:0;border-radius:999px;background:transparent;color:inherit;font-size:11px;line-height:1;cursor:pointer;opacity:.8}
 .dsa-toggle:hover:enabled{background:var(--dsw-alias-interactive-bg-hover);opacity:1}
 .dsa-toggle:disabled{opacity:.45;cursor:default}
@@ -192,28 +201,65 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * How many requests are queued behind the one on screen, mirrored from the
-     * Host poll. The published pending snapshot is frozen when it appears, so the
-     * count lives here and the open panel subscribes to it.
+     * Latest pending state from the Host poll: which Session owns the request on
+     * screen, and how many wait behind it. A published pending snapshot is frozen
+     * when it appears, so the panel badge and the cross-session notice read this
+     * instead of the snapshot they were handed.
      */
-    const queueDepth = { value: 0, listeners: new Set() }
-    const readQueueDepth = () => queueDepth.value
-    const setQueueDepth = (next) => {
-      if (queueDepth.value === next) return
-      queueDepth.value = next
-      for (const listener of [...queueDepth.listeners]) listener()
+    const pendingState = { sessionId: undefined, waiting: 0, listeners: new Set() }
+    const readPendingState = () => pendingState
+    const setPendingState = (sessionId, waiting) => {
+      if (pendingState.sessionId === sessionId && pendingState.waiting === waiting) return
+      pendingState.sessionId = sessionId
+      pendingState.waiting = waiting
+      for (const listener of [...pendingState.listeners]) listener()
     }
-    const subscribeQueueDepth = (listener) => {
-      queueDepth.listeners.add(listener)
+    const subscribePendingState = (listener) => {
+      pendingState.listeners.add(listener)
       return () => {
-        queueDepth.listeners.delete(listener)
+        pendingState.listeners.delete(listener)
       }
     }
+    /** Set by `apply`; opens the Session view that owns a request. */
+    let openSessionView = () => {}
 
     /** `mm:ss` for the remaining lifetime. */
     function formatClock(ms) {
       const total = Math.max(0, Math.ceil(ms / 1000))
       return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`
+    }
+
+    /**
+     * Dock entry for a request that belongs to another Session: the panel itself
+     * only renders in the Session that owns the request, so without this a queued
+     * approval is invisible until the user happens to switch there.
+     */
+    function OtherSessionNotice(props) {
+      const [state, setState] = React.useState(readPendingState)
+      React.useEffect(() => subscribePendingState(() => setState(readPendingState())), [])
+      const owner = state.sessionId
+      // No Session view (the inert state) or the owner is on screen: nothing to say.
+      if (owner === undefined || props.sessionId === undefined || owner === props.sessionId) return null
+      return h('div', { className: 'dsa-dock' }, [
+        h('span', { key: 'dot', className: 'dsa-dock-dot', 'aria-hidden': true }),
+        h('span', { key: 'text', className: 'dsa-dock-text' }, t('otherSession', { count: state.waiting + 1 })),
+        h(
+          'button',
+          {
+            key: 'jump',
+            type: 'button',
+            className: 'dsa-dock-jump',
+            onClick: () => {
+              try {
+                openSessionView(owner)
+              } catch {
+                // the workspace service is optional; the text is still useful
+              }
+            },
+          },
+          t('jump'),
+        ),
+      ])
     }
 
     /** Password panel that replaces the composer while a request is pending. */
@@ -251,8 +297,8 @@ window.__ModuleLoader__.load({
         setReason('')
       }, [pending && pending.key])
 
-      const [waiting, setWaiting] = React.useState(readQueueDepth)
-      React.useEffect(() => subscribeQueueDepth(() => setWaiting(readQueueDepth())), [])
+      const [waiting, setWaiting] = React.useState(() => readPendingState().waiting)
+      React.useEffect(() => subscribePendingState(() => setWaiting(readPendingState().waiting)), [])
 
       // Focus follows the mode: the password field normally, the reason field
       // once the user starts a rejection.
@@ -715,7 +761,8 @@ window.__ModuleLoader__.load({
         if (payload === undefined || payload.ok !== true) return
         const requests = Array.isArray(payload.value && payload.value.requests) ? payload.value.requests : []
         const waiting = payload.value && Number.isFinite(payload.value.waiting) ? payload.value.waiting : 0
-        setQueueDepth(waiting)
+        const head = requests[0]
+        setPendingState(typeof head?.sessionId === 'string' ? head.sessionId : undefined, waiting)
         const seen = new Set()
         for (const snapshot of requests) {
           if (typeof snapshot.id !== 'string' || typeof snapshot.sessionId !== 'string') continue
@@ -750,6 +797,20 @@ window.__ModuleLoader__.load({
             select: ({ pendingInteraction }) => (pendingInteraction instanceof PendingSudo ? pendingInteraction : null),
           },
           SudoPanel,
+        ),
+      )
+
+      openSessionView = (sessionId) => ctx.get('uiWorkspace')?.openSession?.(sessionId)
+
+      ctx.slots.inject('conversation.composer.dock', () =>
+        ctx.slots.register(
+          {
+            name: 'conversation.composer.dock',
+            id: 'sudo-approve-elsewhere',
+            order: 20,
+            locale: NS,
+          },
+          OtherSessionNotice,
         ),
       )
 
