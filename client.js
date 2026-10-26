@@ -40,6 +40,8 @@ window.__ModuleLoader__.load({
       stale: '该请求已失效。',
       failed: '提交失败，请重试。',
       remainingHint: '剩余时间',
+      collapse: '折叠',
+      expand: '展开',
       settingsLabel: 'sudo 授权',
       settingsTitle: 'sudo 授权确认',
       settingsDesc: '智能体执行 sudo 时在聊天框弹出确认面板。这里的设置保存后立即生效，只影响之后发起的请求。',
@@ -80,6 +82,8 @@ window.__ModuleLoader__.load({
       stale: 'This request is no longer pending.',
       failed: 'Could not submit. Try again.',
       remainingHint: 'time left',
+      collapse: 'Collapse',
+      expand: 'Expand',
       settingsLabel: 'sudo approval',
       settingsTitle: 'sudo approval',
       settingsDesc: 'The composer turns into a confirmation panel whenever the agent runs sudo. Settings apply immediately to new requests.',
@@ -111,6 +115,11 @@ window.__ModuleLoader__.load({
 .dsa-lock{font-size:14px;line-height:1}
 .dsa-title{flex:1 1 auto;font-weight:600}
 .dsa-count{flex:0 0 auto;font-size:12px;font-variant-numeric:tabular-nums;opacity:.85}
+.dsa-toggle{flex:0 0 auto;display:grid;place-items:center;box-sizing:border-box;width:22px;height:22px;padding:0;border:0;border-radius:999px;background:transparent;color:inherit;font-size:11px;line-height:1;cursor:pointer;opacity:.8}
+.dsa-toggle:hover:enabled{background:var(--dsw-alias-interactive-bg-hover);opacity:1}
+.dsa-toggle:disabled{opacity:.45;cursor:default}
+.dsa-collapsed{min-height:var(--dsa-collapsed-min-height,96px);justify-content:center}
+.dsa-collapsed .dsa-strip{flex:1 1 auto}
 .dsa-body{display:flex;flex-direction:column;gap:10px;padding:14px 18px 4px}
 .dsa-sub{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
 .dsa-list{display:flex;flex-direction:column;gap:6px;max-height:200px;margin:0;padding:10px 12px;overflow:auto;border-radius:12px;background:var(--dsw-alias-bg-layer-2);list-style:none}
@@ -195,6 +204,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState('')
       const [rejecting, setRejecting] = React.useState(false)
+      const [collapsed, setCollapsed] = React.useState(false)
       const [reason, setReason] = React.useState('')
       const [remaining, setRemaining] = React.useState(() => Math.max(0, (snapshot.expiresAt || 0) - Date.now()))
       const passwordRef = React.useRef(null)
@@ -207,6 +217,12 @@ window.__ModuleLoader__.load({
         const timer = window.setInterval(tick, 1000)
         return () => window.clearInterval(timer)
       }, [snapshot.expiresAt])
+
+      // A new request always starts expanded: a collapsed panel must never hide
+      // a freshly arrived password prompt.
+      React.useEffect(() => {
+        setCollapsed(false)
+      }, [pending && pending.key])
 
       // Focus follows the mode: the password field normally, the reason field
       // once the user starts a rejection.
@@ -282,13 +298,14 @@ window.__ModuleLoader__.load({
         h(
           'div',
           {
-            className: 'dsa-panel',
+            className: collapsed ? 'dsa-panel dsa-collapsed' : 'dsa-panel',
             role: 'group',
             'aria-label': t('title'),
             onKeyDown: (event) => {
               if (event.key !== 'Escape' || busy) return
               event.preventDefault()
-              if (rejecting) closeReject()
+              if (collapsed) setCollapsed(false)
+              else if (rejecting) closeReject()
               else setRejecting(true)
             },
           },
@@ -297,8 +314,21 @@ window.__ModuleLoader__.load({
             h('span', { key: 'lock', className: 'dsa-lock', 'aria-hidden': true }, '🔒'),
             h('span', { key: 'title', className: 'dsa-title' }, t('title')),
             h('span', { key: 'count', className: 'dsa-count', title: t('remainingHint') }, formatClock(remaining)),
+            h(
+              'button',
+              {
+                key: 'toggle',
+                type: 'button',
+                className: 'dsa-toggle',
+                title: collapsed ? t('expand') : t('collapse'),
+                'aria-label': collapsed ? t('expand') : t('collapse'),
+                'aria-expanded': !collapsed,
+                onClick: () => setCollapsed((value) => !value),
+              },
+              collapsed ? '\u25be' : '\u25b4',
+            ),
           ]),
-          h('div', { className: 'dsa-body' }, [
+          collapsed ? null : h('div', { className: 'dsa-body' }, [
             h('div', { key: 'sub', className: 'dsa-sub' }, t('subtitle')),
             h(
               'ul',
@@ -318,7 +348,9 @@ window.__ModuleLoader__.load({
             passwordRequired || rejecting ? null : h('div', { key: 'hint', className: 'dsa-hint' }, t('remembered')),
             error === '' ? null : h('div', { key: 'error', className: 'dsa-error', role: 'alert' }, error),
           ]),
-          rejecting
+          collapsed
+            ? null
+            : rejecting
             ? h('div', { className: 'dsa-actions' }, [
                 h('input', {
                   key: 'reason',

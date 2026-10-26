@@ -27,7 +27,7 @@ import { dirname, join } from 'node:path'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 6
+const BUILD = 7
 /** Exact Fetch routes the browser half calls. */
 const ROUTE_PREFIX = '/api/sudo-approve'
 /** Fallback PATH when the Host process has none. */
@@ -146,12 +146,13 @@ function resolveConfig(raw) {
 }
 
 /**
- * A `sudo` word at a command position: start of line, after a shell separator,
- * after a command substitution, or after a shell keyword. Environment
- * assignments in front of the verb are skipped.
+ * The `sudo` / `sudoedit` word, wherever it appears. Detection is fail-closed on
+ * purpose: an absolute path (`/usr/bin/sudo`), a wrapper (`exec`, `env`,
+ * `xargs`, `timeout`), or a quoted `bash -c "sudo …"` all reach the real
+ * binary, so requiring a command word position under-detects and would let a
+ * command run without the password panel.
  */
-const SUDO_AT_COMMAND_POSITION =
-  /(?:^|[;&|(\n{}`]|\$\(|(?:^|[\s;])then|(?:^|[\s;])do|(?:^|[\s;])else)\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|()]*)\s+)*(?:sudo|sudoedit)(?=$|\s)/
+const SUDO_TOKEN = /(?:^|[^\w-])(?:sudo|sudoedit)(?=$|[^\w-])/
 
 /** Forms that never authenticate, so they must not be given `-A`. */
 const METADATA_ONLY_SUDO =
@@ -177,7 +178,8 @@ function analyzeCommand(command) {
       truncated = true
       break
     }
-    const sudo = SUDO_AT_COMMAND_POSITION.test(text)
+    // A whole-line shell comment can never execute, so it never asks.
+    const sudo = !text.startsWith('#') && SUDO_TOKEN.test(text)
     items.push({
       text: text.length > MAX_DISPLAY_WIDTH ? `${text.slice(0, MAX_DISPLAY_WIDTH)}…` : text,
       sudo,
@@ -556,6 +558,44 @@ export function apply(ctx, rawConfig) {
     if (verdict !== undefined) return verdict
     return next()
   })
+
+  // ----------------------------------------------------------- context ----
+  /**
+   * One runtime-context paragraph: sudo exists here, the asking happens in the
+   * GUI, so the model should write plain sudo instead of trying to
+   * authenticate by itself.
+   */
+  const SUDO_CONTEXT = [
+    '`sudo` is available here: a foreground `bash` call that invokes `sudo` or `sudoedit` shows the user the command in the GUI and asks for their password before it runs.',
+    'Write it plainly (`sudo <command>`) — the approved call authenticates by itself, so never pass a password, pipe one in, or add `-n`/`-S`/askpass flags; `sudo -n` always fails here.',
+    'One approval covers the whole command string, so keep sudo lines few and short. A rejection may quote the user\u2019s reason: do not retry the same command unchanged.',
+    '`sudo -k`, `-K`, `-V` and `-h` alone need no approval; sudo is unavailable in subagents and background jobs.',
+  ].join(' ')
+
+  ctx.effect(() => {
+    const scope = ctx.inject(['systemPrompt'], (child) => {
+      const prompt = child.systemPrompt
+      if (prompt === undefined || typeof prompt.context !== 'function') return
+      const anchor = typeof prompt.getContextOrder === 'function' ? prompt.getContextOrder('APPROVAL_POLICY') : undefined
+      prompt.context({
+        name: `${NAME}:availability`,
+        // Right after the approval-policy line it qualifies.
+        order: Number.isFinite(anchor) ? anchor + 1 : 116,
+        text: (context) => {
+          const agent = context?.agent
+          if (agent === undefined || !config.enabled) return ''
+          // The gate only runs for the root agent in a full-access session.
+          if (!isRootAgent(agent)) return ''
+          const mode = sandboxModeOf(agent)
+          if (mode !== undefined && mode !== 'danger-full-access') return ''
+          return SUDO_CONTEXT
+        },
+      })
+    })
+    return () => {
+      scope?.dispose?.()
+    }
+  }, `${NAME}: context`)
 
   // ----------------------------------------------------------- execute ----
   ctx.on('tools/execute', async (exec, next) => {
