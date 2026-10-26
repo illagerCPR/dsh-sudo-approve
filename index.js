@@ -583,11 +583,14 @@ export function apply(ctx, rawConfig) {
   ctx.effect(() => {
     let restore
     const scope = ctx.inject(['shell'], (child) => {
-      const shell = child.get('shell')
-      if (shell === undefined || typeof shell.resolve !== 'function') return
-      const original = shell.resolve
+      const service = child.get('shell')
+      if (service === undefined || typeof service.resolve !== 'function') return
+      const original = service.resolve
+      /** Counts calls that reached the wrapper; identity cannot be used, see below. */
+      const hits = { count: 0 }
       const patched = function resolve(request) {
-        const spec = original.call(this, request)
+        hits.count += 1
+        const spec = original.call(service, request)
         const run = approvalScope.getStore()
         if (run === undefined || typeof run.bin !== 'string') return spec
         const inherited = isPlainObject(spec.env) && typeof spec.env.PATH === 'string' ? spec.env.PATH : basePath
@@ -596,14 +599,56 @@ export function apply(ctx, rawConfig) {
           env: { ...(isPlainObject(spec.env) ? spec.env : {}), PATH: `${run.bin}:${inherited}` },
         }
       }
+      /**
+       * Whether the write actually reaches callers. Cordis hands out a fresh
+       * proxy for every method read (per-context shadowing), so comparing
+       * `service.resolve` against `patched` always reports a mismatch even when
+       * the assignment worked — the wrapper has to be observed instead. The
+       * probe only builds a spec; nothing is spawned.
+       */
+      const reaches = () => {
+        const before = hits.count
+        try {
+          service.resolve({ command: 'true', workdir: process.cwd() })
+        } catch {
+          return false
+        }
+        return hits.count > before
+      }
+
       try {
-        shell.resolve = patched
-        if (shell.resolve !== patched) throw new Error('shell.resolve is not replaceable')
+        service.resolve = patched
+        if (!reaches()) throw new Error('service instance refused the write')
         scopedShims = true
         restore = () => {
-          if (shell.resolve === patched) shell.resolve = original
+          try {
+            delete service.resolve
+          } catch {
+            service.resolve = original
+          }
           scopedShims = false
         }
+        audit({ event: 'shim-scope', mode: 'instance' })
+        return
+      } catch {
+        // Fall through: patch the class method instead of the instance.
+      }
+
+      try {
+        const proto = Object.getPrototypeOf(service)
+        if (proto === null || typeof proto.resolve !== 'function') throw new Error('no writable resolve on the prototype')
+        const previous = proto.resolve
+        proto.resolve = patched
+        if (!reaches()) {
+          proto.resolve = previous
+          throw new Error('prototype refused the write')
+        }
+        scopedShims = true
+        restore = () => {
+          proto.resolve = previous
+          scopedShims = false
+        }
+        audit({ event: 'shim-scope', mode: 'prototype' })
       } catch (error) {
         audit({ event: 'shim-global', reason: 'shell-not-wrappable', message: errorText(error) })
       }
