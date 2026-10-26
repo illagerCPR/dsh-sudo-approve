@@ -27,7 +27,7 @@ import { dirname, join } from 'node:path'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 10
+const BUILD = 11
 /** Exact Fetch routes the browser half calls. */
 const ROUTE_PREFIX = '/api/sudo-approve'
 /** Fallback PATH when the Host process has none. */
@@ -62,6 +62,12 @@ const RUN_CODE_NAME = 'run_code'
 const PTC_RESERVE_MS = 10_000
 /** Shortest wait a nested request will open the panel for. */
 const MIN_PANEL_MS = 5_000
+/**
+ * How many requests may wait behind the one on screen. The page shows a single
+ * panel, so extra requests queue: refusing them outright made a parallel sudo
+ * call fail for no reason the user could see.
+ */
+const QUEUE_LIMIT = 4
 
 /** Defaults; a `cordis.patch.yml` `config` object overrides them. */
 const DEFAULTS = Object.freeze({
@@ -92,8 +98,9 @@ const MESSAGES = Object.freeze({
   sandbox: (mode) => `sudo 审批：当前会话处于 ${mode} 沙箱，沙箱内无法获取 root。请先把会话权限切换到 danger-full-access 再重试。`,
   remote: 'sudo 审批：本部署接受非回环地址的浏览器连接，插件拒绝在明文网络路径上接收密码（配置项 allowRemoteDeployment=false），已拒绝执行。',
   noClient: 'sudo 审批：当前没有已连接的浏览器页面可以弹出确认面板，已拒绝执行。请在页面打开后重试。',
-  busy: 'sudo 审批：另一个 sudo 请求正在等待确认，同一时间只处理一个，已拒绝执行。请等这笔结清后再发下一笔（并行发起的 sudo 只会有第一笔被处理）。',
+  queueFull: (limit) => `sudo 审批：排在前面等待确认的请求已有 ${limit} 笔，队列已满，已拒绝执行。请等前面的请求处理完再发。`,
   budget: (seconds) => `sudo 审批：所处 run_code 程序的 ${seconds} 秒执行预算已不足以完成确认，已拒绝执行。请把 sudo 调用放到程序开头，或单独放进一个简短的程序重试（并行发起的 sudo 请改为串行）。`,
+  budgetQueued: (seconds) => `sudo 审批：等它轮到面板时，所处 run_code 程序的 ${seconds} 秒执行预算已经用完，已拒绝执行。请把 sudo 调用放到程序开头，或单独放进一个简短的程序重试（并行发起的 sudo 请改为串行）。`,
   rejected: (reason) => (reason === undefined || reason === '' ? 'sudo 审批：用户拒绝执行该 sudo 命令。' : `sudo 审批：用户拒绝执行该 sudo 命令。拒绝理由：${reason}`),
   timeout: (seconds) => `sudo 审批：${seconds} 秒内没有收到确认，已拒绝执行。`,
   invalidPassword: 'sudo 审批：密码校验未通过。',
@@ -271,6 +278,8 @@ export function apply(ctx, rawConfig) {
 
   /** The one request currently waiting for the page, if any. */
   let inflight
+  /** Requests waiting for their turn, oldest first; `inflight` is not in here. */
+  const queue = []
   /** callId → validated password, released by the matching dispatch. */
   const armed = new Map()
   /** sessionId → { secret, usedAt } in `remember` mode. */
@@ -505,19 +514,86 @@ export function apply(ctx, rawConfig) {
    * a request with too little left is refused up front instead of opening a
    * panel nobody can finish in time.
    * @param exec - the nested call.
-   * @returns the wait to use, or the reason to refuse it.
+   * @returns `{ waitMs, deadlineAt }`, or `{ deny }` when no panel would fit.
    */
-  function nestedWait(exec) {
+  function nestedPlan(exec) {
     const budget = ptcBudgetMs()
     if (budget === undefined) return { waitMs: config.timeoutMs }
     const startedAt = ptcParents.get(exec.parent)
-    const left = budget - (startedAt === undefined ? 0 : Date.now() - startedAt) - PTC_RESERVE_MS
+    const deadlineAt = (startedAt === undefined ? Date.now() : startedAt) + budget - PTC_RESERVE_MS
+    const left = deadlineAt - Date.now()
     if (left < MIN_PANEL_MS) return { deny: MESSAGES.budget(Math.round(budget / 1000)) }
-    return { waitMs: Math.min(config.timeoutMs, Math.floor(left)) }
+    return { waitMs: Math.min(config.timeoutMs, Math.floor(left)), deadlineAt }
   }
 
-  /** Ask the page and resolve the whole gate for one sudo command. */
-  async function askForApproval(exec, analysis, waitMs) {
+  /** Whether a page has polled recently enough to show a panel. */
+  function pagePresent() {
+    return lastPollAt !== 0 && Date.now() - lastPollAt <= config.presenceWindowMs
+  }
+
+  /** Put one request on screen: fix its deadline, log it, start its timer. */
+  function admit(request) {
+    request.state = 'visible'
+    request.startedAt = Date.now()
+    if (request.deadlineAt !== undefined) {
+      // It may have queued for a while, so re-measure instead of trusting the
+      // wait computed when it arrived.
+      request.waitMs = Math.max(MIN_PANEL_MS, Math.min(request.waitMs, Math.floor(request.deadlineAt - request.startedAt)))
+    }
+    request.expiresAt = request.startedAt + request.waitMs
+    inflight = request
+    audit({
+      event: 'request',
+      id: request.id,
+      sessionId: request.sessionId,
+      callId: request.callId,
+      lines: request.items.length,
+      waitMs: request.waitMs,
+      ...(request.nested ? { channel: 'ptc' } : {}),
+      ...(request.position > 1 ? { position: request.position } : {}),
+      cwd: request.cwd,
+    })
+    request.start?.()
+  }
+
+  /**
+   * Show the next queued request, skipping any that can no longer be answered:
+   * the page has gone away, or a nested request's program budget no longer has
+   * room for a panel at all. Skipping rather than opening a doomed panel keeps
+   * the queue moving.
+   */
+  function pump() {
+    if (inflight !== undefined) return
+    while (queue.length > 0) {
+      const next = queue[0]
+      if (!pagePresent()) {
+        queue.shift()
+        next.settle?.({ kind: 'noClient' })
+        continue
+      }
+      if (next.deadlineAt !== undefined && next.deadlineAt - Date.now() < MIN_PANEL_MS) {
+        queue.shift()
+        next.settle?.({ kind: 'budget' })
+        continue
+      }
+      queue.shift()
+      admit(next)
+      return
+    }
+  }
+
+  /**
+   * Ask the page and resolve the whole gate for one sudo command.
+   *
+   * The page renders a single panel, so a second request waits in line instead
+   * of being refused. Its own wait only starts when it reaches the screen; a
+   * nested request additionally cannot outlive its program's budget, so it gives
+   * up while still queued once no panel would fit.
+   * @param exec - the tool call being gated.
+   * @param analysis - the command analysis (lines to show).
+   * @param plan - `{ waitMs, deadlineAt? }` from `nestedPlan`.
+   */
+  async function askForApproval(exec, analysis, plan) {
     let session
     let cwd
     try {
@@ -531,44 +607,70 @@ export function apply(ctx, rawConfig) {
       callId: exec.callId,
       sessionId: exec.agent.id,
       createdAt: Date.now(),
-      expiresAt: Date.now() + waitMs,
       cwd,
       items: analysis.items,
+      nested: exec.parent !== undefined,
+      waitMs: plan.waitMs,
+      deadlineAt: plan.deadlineAt,
+      expiresAt: undefined,
+      state: 'queued',
+      position: 1,
       settle: undefined,
+      start: undefined,
       resolving: false,
     }
-    inflight = request
-    audit({
-      event: 'request',
-      id: request.id,
-      sessionId: request.sessionId,
-      callId: request.callId,
-      lines: analysis.items.length,
-      waitMs,
-      ...(exec.parent === undefined ? {} : { channel: 'ptc' }),
-      cwd,
-    })
-    const decision = await new Promise((resolve) => {
+    const decided = new Promise((resolve) => {
       let finished = false
+      let panelTimer
+      let deadlineTimer
       const finish = (value) => {
         if (finished) return
         finished = true
-        clearTimeout(timer)
+        clearTimeout(panelTimer)
+        clearTimeout(deadlineTimer)
         exec.signal?.removeEventListener('abort', onAbort)
         resolve(value)
       }
-      const timer = setTimeout(() => finish({ kind: 'timeout' }), waitMs)
       const onAbort = () => finish({ kind: 'cancelled' })
       request.settle = finish
+      request.start = () => {
+        // On screen now: the panel's own wait (already clamped to the budget)
+        // owns the deadline, so the queue guard must not fire first.
+        clearTimeout(deadlineTimer)
+        deadlineTimer = undefined
+        panelTimer = setTimeout(() => finish({ kind: 'timeout' }), request.waitMs)
+      }
+      // A nested request that runs out of program budget while still queued must
+      // give up here: by the time it reached the screen nothing could be typed.
+      if (request.deadlineAt !== undefined) {
+        const leave = Math.max(0, request.deadlineAt - MIN_PANEL_MS - Date.now())
+        deadlineTimer = setTimeout(() => finish({ kind: 'budget' }), leave)
+      }
       if (exec.signal?.aborted === true) {
         finish({ kind: 'cancelled' })
         return
       }
       exec.signal?.addEventListener('abort', onAbort, { once: true })
     }).finally(() => {
+      const index = queue.indexOf(request)
+      if (index >= 0) queue.splice(index, 1)
       if (inflight === request) inflight = undefined
+      pump()
     })
-    return { request, decision }
+    queue.push(request)
+    pump()
+    if (request.state === 'queued') {
+      request.position = queue.indexOf(request) + 1
+      audit({
+        event: 'queued',
+        id: request.id,
+        sessionId: request.sessionId,
+        callId: request.callId,
+        lines: request.items.length,
+        position: request.position,
+      })
+    }
+    return { request, decision: await decided }
   }
 
   /** Decide one sudo-bearing bash call. */
@@ -590,8 +692,13 @@ export function apply(ctx, rawConfig) {
         return { kind: 'deny', reason: MESSAGES.remote }
       }
     }
-    if (inflight !== undefined || armed.size > 0) return { kind: 'deny', reason: MESSAGES.busy }
-    if (lastPollAt === 0 || Date.now() - lastPollAt > config.presenceWindowMs) {
+    // The panel is one at a time, so parallel calls line up behind it. Only a
+    // queue that is already full is refused, and it says so.
+    if (queue.length >= QUEUE_LIMIT) {
+      audit({ event: 'denied', reason: 'queue-full', sessionId: exec.agent.id, callId: exec.callId })
+      return { kind: 'deny', reason: MESSAGES.queueFull(QUEUE_LIMIT) }
+    }
+    if (!pagePresent()) {
       audit({ event: 'denied', reason: 'no-client', sessionId: exec.agent.id })
       return { kind: 'deny', reason: MESSAGES.noClient }
     }
@@ -599,17 +706,16 @@ export function apply(ctx, rawConfig) {
     // A PTC sub-dispatch is how that presentation reaches any tool, so it is a
     // normal path rather than a nested bypass: the password is still required.
     // What differs is the wait, which has to fit inside the program's budget.
-    let waitMs = config.timeoutMs
+    let plan = { waitMs: config.timeoutMs }
     if (exec.parent !== undefined) {
-      const nested = nestedWait(exec)
-      if (nested.deny !== undefined) {
+      plan = nestedPlan(exec)
+      if (plan.deny !== undefined) {
         audit({ event: 'denied', reason: 'ptc-budget', sessionId: exec.agent.id, callId: exec.callId })
-        return { kind: 'deny', reason: nested.deny }
+        return { kind: 'deny', reason: plan.deny }
       }
-      waitMs = nested.waitMs
     }
 
-    const { request, decision } = await askForApproval(exec, analysis, waitMs)
+    const { request, decision } = await askForApproval(exec, analysis, plan)
     if (decision.kind === 'approved' && typeof decision.secret === 'string' && decision.secret !== '') {
       armed.set(exec.callId, { secret: decision.secret, at: Date.now() })
       audit({ event: 'approved', id: request.id, sessionId: request.sessionId, callId: request.callId })
@@ -623,8 +729,16 @@ export function apply(ctx, rawConfig) {
       audit({ event: 'cancelled', id: request.id, sessionId: request.sessionId })
       return { kind: 'cancel' }
     }
+    if (decision.kind === 'budget') {
+      audit({ event: 'denied', reason: 'ptc-budget', id: request.id, sessionId: request.sessionId, callId: request.callId, queued: true })
+      return { kind: 'deny', reason: MESSAGES.budgetQueued(Math.round((ptcBudgetMs() ?? config.timeoutMs) / 1000)) }
+    }
+    if (decision.kind === 'noClient') {
+      audit({ event: 'denied', reason: 'no-client', id: request.id, sessionId: request.sessionId, queued: true })
+      return { kind: 'deny', reason: MESSAGES.noClient }
+    }
     audit({ event: 'timeout', id: request.id, sessionId: request.sessionId })
-    return { kind: 'deny', reason: MESSAGES.timeout(Math.round(waitMs / 1000)) }
+    return { kind: 'deny', reason: MESSAGES.timeout(Math.round(request.waitMs / 1000)) }
   }
 
   /** Gate one tool call; returns a decision or undefined to dispatch. */
@@ -656,7 +770,7 @@ export function apply(ctx, rawConfig) {
   const SUDO_RULES = [
     'Write it plainly (`sudo <command>`) — the approved call authenticates by itself, so never pass a password, pipe one in, or add `-n`/`-S`/askpass flags; `sudo -n` always fails here.',
     'One approval covers the whole command string, so keep sudo lines few and short. A rejection may quote the user\u2019s reason: do not retry the same command unchanged.',
-    'Only one approval is open at a time: sudo calls must be sequential, never parallel. `sudo -k`, `-K`, `-V` and `-h` alone need no approval; sudo is unavailable in subagents and background jobs.',
+    'Approvals are handled one at a time in arrival order: a parallel sudo call waits in line instead of failing, but each wait delays the command behind it, so keep sudo calls sequential and few. `sudo -k`, `-K`, `-V` and `-h` alone need no approval; sudo is unavailable in subagents and background jobs.',
   ].join(' ')
 
   /**
@@ -682,7 +796,7 @@ export function apply(ctx, rawConfig) {
     const span = budget === undefined ? 'fixed elapsed budget' : `${Math.round(budget / 1000)} second elapsed budget`
     return [
       '`sudo` is available here through `run_code`: a `tools.bash` call whose command invokes `sudo` or `sudoedit` shows the user the command in the GUI and asks for their password while the program waits.',
-      `That wait, and the command itself, are charged to the program\u2019s ${span}, so put the sudo call near the start of a short program; a request whose program has too little time left is refused before any panel opens, and the answer is to rerun that sudo call in its own small program.`,
+      `That wait, and the command itself, are charged to the program\u2019s ${span}, so put the sudo call near the start of a short program; a request whose program has too little time left is refused before any panel opens, or gives up while still waiting in line, and the answer is to rerun that sudo call in its own small program.`,
       SUDO_RULES,
     ].join(' ')
   }
@@ -745,12 +859,16 @@ export function apply(ctx, rawConfig) {
   })
 
   // ------------------------------------------------------------- routes ---
-  /** Value the page polls for. */
+  /**
+   * Value the page polls for: the one request on screen plus how many are
+   * waiting behind it, so the panel can say that a parallel call is in line.
+   */
   function snapshot() {
-    if (inflight === undefined) return { requests: [] }
+    const waiting = queue.length
+    if (inflight === undefined) return { requests: [], waiting }
     const { id, sessionId, createdAt, expiresAt, cwd, items } = inflight
     const memo = config.remember === 'session' ? remembered.get(sessionId) : undefined
-    return { requests: [{ id, sessionId, createdAt, expiresAt, cwd, items, passwordRequired: memo === undefined }] }
+    return { requests: [{ id, sessionId, createdAt, expiresAt, cwd, items, passwordRequired: memo === undefined }], waiting }
   }
 
   const respondJson = (payload, status = 200) =>
@@ -884,6 +1002,10 @@ export function apply(ctx, rawConfig) {
       process.off('exit', onExit)
       clearInterval(timer)
       hardCleanup()
+      // Unload either way: queued models must not wait for a panel that will
+      // never come, so every waiter is settled before the state is dropped.
+      for (const request of queue.splice(0, queue.length)) request.settle?.({ kind: 'cancelled' })
+      inflight?.settle?.({ kind: 'cancelled' })
       inflight = undefined
       armed.clear()
       remembered.clear()

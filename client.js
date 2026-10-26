@@ -40,6 +40,7 @@ window.__ModuleLoader__.load({
       stale: '该请求已失效。',
       failed: '提交失败，请重试。',
       remainingHint: '剩余时间',
+      queueHint: '另有 {count} 笔排队',
       collapse: '折叠',
       expand: '展开',
       settingsLabel: 'sudo 授权',
@@ -82,6 +83,7 @@ window.__ModuleLoader__.load({
       stale: 'This request is no longer pending.',
       failed: 'Could not submit. Try again.',
       remainingHint: 'time left',
+      queueHint: '{count} more waiting',
       collapse: 'Collapse',
       expand: 'Expand',
       settingsLabel: 'sudo approval',
@@ -115,6 +117,7 @@ window.__ModuleLoader__.load({
 .dsa-lock{font-size:14px;line-height:1}
 .dsa-title{flex:1 1 auto;font-weight:600}
 .dsa-count{flex:0 0 auto;font-size:12px;font-variant-numeric:tabular-nums;opacity:.85}
+.dsa-queue{flex:0 0 auto;font-size:12px;padding:1px 8px;border-radius:999px;background:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-state-warn-tertiary);opacity:.9;white-space:nowrap}
 .dsa-toggle{flex:0 0 auto;display:grid;place-items:center;box-sizing:border-box;width:22px;height:22px;padding:0;border:0;border-radius:999px;background:transparent;color:inherit;font-size:11px;line-height:1;cursor:pointer;opacity:.8}
 .dsa-toggle:hover:enabled{background:var(--dsw-alias-interactive-bg-hover);opacity:1}
 .dsa-toggle:disabled{opacity:.45;cursor:default}
@@ -188,6 +191,25 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * How many requests are queued behind the one on screen, mirrored from the
+     * Host poll. The published pending snapshot is frozen when it appears, so the
+     * count lives here and the open panel subscribes to it.
+     */
+    const queueDepth = { value: 0, listeners: new Set() }
+    const readQueueDepth = () => queueDepth.value
+    const setQueueDepth = (next) => {
+      if (queueDepth.value === next) return
+      queueDepth.value = next
+      for (const listener of [...queueDepth.listeners]) listener()
+    }
+    const subscribeQueueDepth = (listener) => {
+      queueDepth.listeners.add(listener)
+      return () => {
+        queueDepth.listeners.delete(listener)
+      }
+    }
+
     /** `mm:ss` for the remaining lifetime. */
     function formatClock(ms) {
       const total = Math.max(0, Math.ceil(ms / 1000))
@@ -218,11 +240,19 @@ window.__ModuleLoader__.load({
         return () => window.clearInterval(timer)
       }, [snapshot.expiresAt])
 
-      // A new request always starts expanded: a collapsed panel must never hide
-      // a freshly arrived password prompt.
+      // A new request always starts expanded and empty: a collapsed panel must
+      // never hide a freshly arrived password prompt, and a password typed for
+      // the previous request must not carry over to the next one in the queue.
       React.useEffect(() => {
         setCollapsed(false)
+        setPassword('')
+        setError('')
+        setRejecting(false)
+        setReason('')
       }, [pending && pending.key])
+
+      const [waiting, setWaiting] = React.useState(readQueueDepth)
+      React.useEffect(() => subscribeQueueDepth(() => setWaiting(readQueueDepth())), [])
 
       // Focus follows the mode: the password field normally, the reason field
       // once the user starts a rejection.
@@ -234,7 +264,7 @@ window.__ModuleLoader__.load({
         } catch {
           // focus is a convenience only
         }
-      }, [rejecting])
+      }, [rejecting, pending && pending.key])
 
       const closeReject = () => {
         if (busy) return
@@ -313,6 +343,9 @@ window.__ModuleLoader__.load({
           h('div', { className: 'dsa-strip' }, [
             h('span', { key: 'lock', className: 'dsa-lock', 'aria-hidden': true }, '🔒'),
             h('span', { key: 'title', className: 'dsa-title' }, t('title')),
+            waiting > 0
+              ? h('span', { key: 'queue', className: 'dsa-queue' }, t('queueHint', { count: waiting }))
+              : null,
             h('span', { key: 'count', className: 'dsa-count', title: t('remainingHint') }, formatClock(remaining)),
             h(
               'button',
@@ -681,6 +714,8 @@ window.__ModuleLoader__.load({
         const payload = await response.json().catch(() => undefined)
         if (payload === undefined || payload.ok !== true) return
         const requests = Array.isArray(payload.value && payload.value.requests) ? payload.value.requests : []
+        const waiting = payload.value && Number.isFinite(payload.value.waiting) ? payload.value.waiting : 0
+        setQueueDepth(waiting)
         const seen = new Set()
         for (const snapshot of requests) {
           if (typeof snapshot.id !== 'string' || typeof snapshot.sessionId !== 'string') continue
