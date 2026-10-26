@@ -27,7 +27,7 @@ import { dirname, join } from 'node:path'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 8
+const BUILD = 9
 /** Exact Fetch routes the browser half calls. */
 const ROUTE_PREFIX = '/api/sudo-approve'
 /** Fallback PATH when the Host process has none. */
@@ -651,29 +651,39 @@ export function apply(ctx, rawConfig) {
   })
 
   // ----------------------------------------------------------- context ----
-  /**
-   * The runtime-context paragraph: sudo exists here, the asking happens in the
-   * GUI, so the model should write plain sudo instead of trying to
-   * authenticate by itself.
-   */
-  const SUDO_CONTEXT = [
-    '`sudo` is available here: a foreground `bash` call that invokes `sudo` or `sudoedit` shows the user the command in the GUI and asks for their password before it runs.',
+  // The rules are the same whichever way the model reaches bash; only the
+  // opening sentence (how to get to sudo at all) depends on the presentation.
+  const SUDO_RULES = [
     'Write it plainly (`sudo <command>`) — the approved call authenticates by itself, so never pass a password, pipe one in, or add `-n`/`-S`/askpass flags; `sudo -n` always fails here.',
     'One approval covers the whole command string, so keep sudo lines few and short. A rejection may quote the user\u2019s reason: do not retry the same command unchanged.',
     'Only one approval is open at a time: sudo calls must be sequential, never parallel. `sudo -k`, `-K`, `-V` and `-h` alone need no approval; sudo is unavailable in subagents and background jobs.',
   ].join(' ')
 
   /**
-   * The extra paragraph for a PTC presentation, where reaching `bash` costs a
-   * nested sub-dispatch and the approval wait is charged to the program budget.
+   * The runtime-context paragraph for a native presentation: sudo exists here,
+   * the asking happens in the GUI, so the model should write plain sudo instead
+   * of trying to authenticate by itself.
+   */
+  const SUDO_CONTEXT = [
+    '`sudo` is available here: a foreground `bash` call that invokes `sudo` or `sudoedit` shows the user the command in the GUI and asks for their password before it runs.',
+    SUDO_RULES,
+  ].join(' ')
+
+  /**
+   * The paragraph for a PTC presentation, where reaching `bash` costs a nested
+   * sub-dispatch and the approval wait is charged to the program budget. It
+   * replaces the native opening sentence instead of preceding it: both describe
+   * how to invoke sudo, and shipping both would hand the model two different
+   * calling conventions at once.
    * @returns the paragraph for this deployment.
    */
   function ptcContext() {
     const budget = ptcBudgetMs()
     const span = budget === undefined ? 'a fixed elapsed budget' : `a ${Math.round(budget / 1000)} second elapsed budget`
     return [
-      'Tools here are reached through `run_code`, so run sudo inside the program: `await tools.bash({ command: \'sudo <command>\' })`. The GUI shows the approval panel while the program waits.',
+      '`sudo` is available here through `run_code`: a `tools.bash` call whose command invokes `sudo` or `sudoedit` shows the user the command in the GUI and asks for their password while the program waits.',
       `That wait, and the command itself, are charged to the program\u2019s ${span}, so put the sudo call near the start of a short program; a request whose program has too little time left is refused before any panel opens, and the answer is to rerun that sudo call in its own small program.`,
+      SUDO_RULES,
     ].join(' ')
   }
 
@@ -693,7 +703,8 @@ export function apply(ctx, rawConfig) {
           if (!isRootAgent(agent)) return ''
           const mode = sandboxModeOf(agent)
           if (mode !== undefined && mode !== 'danger-full-access') return ''
-          return presentsPtc(agent) ? `${ptcContext()} ${SUDO_CONTEXT}` : SUDO_CONTEXT
+          // Both variants carry the shared rules; only the opening differs.
+          return presentsPtc(agent) ? ptcContext() : SUDO_CONTEXT
         },
       })
     })
