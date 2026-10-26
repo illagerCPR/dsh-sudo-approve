@@ -27,7 +27,7 @@ import { dirname, join } from 'node:path'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 9
+const BUILD = 10
 /** Exact Fetch routes the browser half calls. */
 const ROUTE_PREFIX = '/api/sudo-approve'
 /** Fallback PATH when the Host process has none. */
@@ -679,7 +679,7 @@ export function apply(ctx, rawConfig) {
    */
   function ptcContext() {
     const budget = ptcBudgetMs()
-    const span = budget === undefined ? 'a fixed elapsed budget' : `a ${Math.round(budget / 1000)} second elapsed budget`
+    const span = budget === undefined ? 'fixed elapsed budget' : `${Math.round(budget / 1000)} second elapsed budget`
     return [
       '`sudo` is available here through `run_code`: a `tools.bash` call whose command invokes `sudo` or `sudoedit` shows the user the command in the GUI and asks for their password while the program waits.',
       `That wait, and the command itself, are charged to the program\u2019s ${span}, so put the sudo call near the start of a short program; a request whose program has too little time left is refused before any panel opens, and the answer is to rerun that sudo call in its own small program.`,
