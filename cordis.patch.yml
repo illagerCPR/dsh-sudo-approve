@@ -4,6 +4,8 @@
       config:
         enabled: true
         remember: never
+        # auto：能借用 sudo 时间戳缓存时就借，否则本次执行准备临时凭据
+        credential: auto
         timeoutMs: 120000
         presenceWindowMs: 15000
         allowRemoteDeployment: false
