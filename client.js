@@ -387,7 +387,6 @@ window.__ModuleLoader__.load({
               else setRejecting(true)
             },
           },
-          h('style', { dangerouslySetInnerHTML: { __html: CSS } }),
           h('div', { className: 'dsa-strip' }, [
             h('span', { key: 'lock', className: 'dsa-lock', 'aria-hidden': true }, '🔒'),
             h('span', { key: 'title', className: 'dsa-title' }, t('title')),
@@ -681,7 +680,6 @@ window.__ModuleLoader__.load({
       return h(
         'div',
         { className: 'dsa-set' },
-        h('style', { dangerouslySetInnerHTML: { __html: SETTINGS_CSS } }),
         h('div', { className: 'dsa-set-head' }, [
           h('h2', { key: 'title', className: 'dsa-set-title' }, t('settingsTitle')),
           h('p', { key: 'desc', className: 'dsa-set-desc' }, t('settingsDesc')),
@@ -731,6 +729,18 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       ctx.effect(() => ctx.locale.register(NS, { zh, en }), `${NS}: dictionaries`)
       t = ctx.locale.bind(NS)
+
+      // The dock notice renders in Sessions that have no panel mounted, so the
+      // stylesheet cannot live inside a component: it goes on the document once.
+      ctx.effect(() => {
+        const node = document.createElement('style')
+        node.dataset.dshSudoApprove = ''
+        node.textContent = `${CSS}\n${SETTINGS_CSS}`
+        document.head.append(node)
+        return () => {
+          node.remove()
+        }
+      }, `${NS}: styles`)
 
       const publish = ctx.uiSession.registerPendingInteraction(() => 0)
       /** id → { pending, remove }; mirrors what the Host reports as pending. */
