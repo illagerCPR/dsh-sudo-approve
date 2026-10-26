@@ -38,6 +38,7 @@ window.__ModuleLoader__.load({
       invalidPassword: '密码不正确，请重试。',
       passwordRequired: '请输入密码。',
       stale: '该请求已失效。',
+      noInteraction: '这次批准没有被识别为页面上的真实操作，请重新点击一次。',
       failed: '提交失败，请重试。',
       remainingHint: '剩余时间',
       queueHint: '另有 {count} 笔排队',
@@ -66,6 +67,7 @@ window.__ModuleLoader__.load({
       settingsSaving: '保存中…',
       settingsSaveFailed: '保存失败，请重试。',
       settingsLoadFailed: '读取配置失败，请刷新页面重试。',
+      settingsFileOnly: '只读：请在配置文件里修改',
       unitSeconds: '秒',
     }
 
@@ -83,6 +85,7 @@ window.__ModuleLoader__.load({
       invalidPassword: 'Wrong password. Try again.',
       passwordRequired: 'Enter the password.',
       stale: 'This request is no longer pending.',
+      noInteraction: 'The approval was not recognised as a real click on this page. Try again.',
       failed: 'Could not submit. Try again.',
       remainingHint: 'time left',
       queueHint: '{count} more waiting',
@@ -111,6 +114,7 @@ window.__ModuleLoader__.load({
       settingsSaving: 'Saving…',
       settingsSaveFailed: 'Could not save. Try again.',
       settingsLoadFailed: 'Could not read the settings. Refresh the page and retry.',
+      settingsFileOnly: 'Read-only: change it in the config file',
       unitSeconds: 's',
     }
 
@@ -166,6 +170,8 @@ window.__ModuleLoader__.load({
 .dsa-set-desc{margin:4px 0 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
 .dsa-set-row{display:flex;align-items:flex-start;gap:16px;padding:14px 0;border-top:1px solid var(--dsw-alias-border-l1)}
 .dsa-set-head+.dsa-set-row{border-top:none}
+.dsa-set-ro{display:flex;flex-direction:column;align-items:flex-end;gap:2px;text-align:right}
+.dsa-set-ro-value{font-weight:600;color:var(--dsw-alias-label-primary)}
 .dsa-set-main{flex:1 1 auto;min-width:0}
 .dsa-set-name{font-size:13px;line-height:20px}
 .dsa-set-hint{margin-top:2px;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary)}
@@ -327,13 +333,17 @@ window.__ModuleLoader__.load({
         setError('')
         try {
           const body = { id: pending.key, decision }
+          // An approval has to carry the click that produced it; the Host also
+          // refuses an approval from a page that stopped reporting itself visible.
+          const flags = decision === 'approve' ? '?state=visible&interaction=1' : ''
           if (decision === 'approve') {
+            body.interaction = true
             if (password !== '') body.password = password
           } else {
             const trimmed = reason.trim()
             if (trimmed !== '') body.reason = trimmed
           }
-          const response = await fetch(RESPOND_ENDPOINT, {
+          const response = await fetch(`${RESPOND_ENDPOINT}${flags}`, {
             method: 'POST',
             credentials: 'same-origin',
             headers: { 'content-type': 'application/json' },
@@ -353,6 +363,8 @@ window.__ModuleLoader__.load({
             setError(t('passwordRequired'))
           } else if (code === 'sudo-approve/stale') {
             setError(t('stale'))
+          } else if (code === 'sudo-approve/no-interaction') {
+            setError(t('noInteraction'))
           } else {
             setError(t('failed'))
           }
@@ -596,24 +608,15 @@ window.__ModuleLoader__.load({
         h('div', { key: 'control', className: 'dsa-set-control' }, control),
       ]
 
-      const switchRow = (key, name, hint, checked, onToggle) =>
+      const readonlyRow = (key, name, hint, valueText) =>
         h('div', { key, className: 'dsa-set-row' },
           row(
             name,
             hint,
-            h(
-              'button',
-              {
-                type: 'button',
-                role: 'switch',
-                className: 'dsa-switch',
-                'aria-checked': checked === true,
-                'aria-label': name,
-                disabled,
-                onClick: onToggle,
-              },
-              h('span', { className: 'dsa-knob' }),
-            ),
+            h('div', { className: 'dsa-set-ro' }, [
+              h('span', { key: 'value', className: 'dsa-set-ro-value' }, valueText),
+              h('span', { key: 'note', className: 'dsa-set-hint' }, t('settingsFileOnly')),
+            ]),
           ),
         )
 
@@ -639,35 +642,11 @@ window.__ModuleLoader__.load({
           ]),
         )
 
-      const rememberRow = h('div', { key: 'remember', className: 'dsa-set-row' },
-        row(
-          t('settingsRemember'),
-          t('settingsRememberHint'),
-          h('div', { className: 'dsa-seg' }, [
-            h(
-              'button',
-              {
-                key: 'never',
-                type: 'button',
-                'aria-pressed': values.remember === 'never',
-                disabled,
-                onClick: () => send({ patch: { remember: 'never' } }, t('settingsSaved')),
-              },
-              t('rememberNever'),
-            ),
-            h(
-              'button',
-              {
-                key: 'session',
-                type: 'button',
-                'aria-pressed': values.remember === 'session',
-                disabled,
-                onClick: () => send({ patch: { remember: 'session' } }, t('settingsSaved')),
-              },
-              t('rememberSession'),
-            ),
-          ]),
-        ),
+      const rememberRow = readonlyRow(
+        'remember',
+        t('settingsRemember'),
+        t('settingsRememberHint'),
+        values.remember === 'session' ? t('rememberSession') : t('rememberNever'),
       )
 
       const footer =
@@ -684,12 +663,11 @@ window.__ModuleLoader__.load({
           h('h2', { key: 'title', className: 'dsa-set-title' }, t('settingsTitle')),
           h('p', { key: 'desc', className: 'dsa-set-desc' }, t('settingsDesc')),
         ]),
-        switchRow(
+        readonlyRow(
           'enabled',
           t('settingsEnabled'),
           t('settingsEnabledHint'),
-          values.enabled,
-          () => send({ patch: { enabled: !values.enabled } }, t('settingsSaved')),
+          values.enabled === false ? '—' : '✓',
         ),
         rememberRow,
         numberRow('timeout', t('settingsTimeout'), t('settingsTimeoutHint'), 'timeoutMs', limits.timeoutMs),
@@ -700,12 +678,11 @@ window.__ModuleLoader__.load({
           'presenceWindowMs',
           limits.presenceWindowMs,
         ),
-        switchRow(
+        readonlyRow(
           'remote',
           t('settingsRemote'),
           t('settingsRemoteHint'),
-          values.allowRemoteDeployment,
-          () => send({ patch: { allowRemoteDeployment: !values.allowRemoteDeployment } }, t('settingsSaved')),
+          values.allowRemoteDeployment === true ? '✓' : '—',
         ),
         h('div', { className: 'dsa-set-foot' }, [
           h('div', { key: 'status', className: 'dsa-set-status', 'data-error': failed, title: footer }, footer),
@@ -746,6 +723,25 @@ window.__ModuleLoader__.load({
       /** id → { pending, remove }; mirrors what the Host reports as pending. */
       const live = new Map()
 
+      // Presence: the Host refuses to open a panel for a page that never says it
+      // is on screen, and an approval has to carry a real gesture. Both are
+      // claims made by this page, so they are a speed bump, not a proof.
+      let gestureAt = 0
+      ctx.effect(() => {
+        const onGesture = () => {
+          gestureAt = Date.now()
+        }
+        const options = { capture: true, passive: true }
+        document.addEventListener('pointerdown', onGesture, options)
+        document.addEventListener('keydown', onGesture, options)
+        document.addEventListener('focusin', onGesture, options)
+        return () => {
+          document.removeEventListener('pointerdown', onGesture, options)
+          document.removeEventListener('keydown', onGesture, options)
+          document.removeEventListener('focusin', onGesture, options)
+        }
+      }, `${NS}: presence gestures`)
+
       const drop = (id) => {
         const entry = live.get(id)
         if (entry === undefined) return
@@ -761,7 +757,10 @@ window.__ModuleLoader__.load({
       const sync = async () => {
         let response
         try {
-          response = await fetch(PENDING_ENDPOINT, {
+          const visible = document.visibilityState === 'visible'
+          const interacted = gestureAt !== 0 && Date.now() - gestureAt < 5_000
+          const query = `?state=${visible ? 'visible' : 'hidden'}${interacted ? '&interaction=1' : ''}`
+          response = await fetch(`${PENDING_ENDPOINT}${query}`, {
             credentials: 'same-origin',
             headers: { accept: 'application/json' },
           })
