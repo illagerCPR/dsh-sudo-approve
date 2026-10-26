@@ -17,9 +17,10 @@
  * @module dsh-sudo-approve
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
-import { appendFileSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -27,13 +28,27 @@ import { dirname, join } from 'node:path'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 11
+const BUILD = 12
 /** Exact Fetch routes the browser half calls. */
 const ROUTE_PREFIX = '/api/sudo-approve'
 /** Fallback PATH when the Host process has none. */
 const FALLBACK_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 /** Bounds for the tunable config values. */
-const LIMITS = { timeoutMs: [5_000, 900_000], presenceWindowMs: [2_000, 300_000] }
+const LIMITS = {
+  timeoutMs: [5_000, 900_000],
+  presenceWindowMs: [2_000, 300_000],
+  memoryTtlMs: [60_000, 24 * 60 * 60 * 1000],
+}
+
+/**
+ * Candidates for the real sudo. Resolution is confined to root-owned locations
+ * and re-validated after `realpath`, because the password is handed to whatever
+ * binary this ends up naming: a writable directory on `PATH` must never be able
+ * to answer that question.
+ */
+const SUDO_CANDIDATES = Object.freeze(['/usr/bin/sudo', '/bin/sudo'])
+/** The same treatment for sudoedit, which the shim also shadows. */
+const SUDOEDIT_CANDIDATES = Object.freeze(['/usr/bin/sudoedit', '/bin/sudoedit'])
 
 /**
  * Generated `sudo` shim. It exists only while an approved command runs and only
@@ -75,6 +90,12 @@ const DEFAULTS = Object.freeze({
   enabled: true,
   /** `never` asks for the password every time; `session` reuses it in memory. */
   remember: 'never',
+  /**
+   * How the validated password reaches the command: `askpass` installs a shim
+   * that adds `-A` for exactly one spawn, `timestamp` relies on the sudo
+   * credential cache, and `auto` probes the cache and falls back to the shim.
+   */
+  credential: 'auto',
   /** How long the password panel stays open before it denies. */
   timeoutMs: 120_000,
   /** How recently a page must have polled to count as connected. */
@@ -85,6 +106,8 @@ const DEFAULTS = Object.freeze({
   allowRemoteDeployment: false,
   /** Remembered passwords idle for this long are dropped. */
   memoryTtlMs: 6 * 60 * 60 * 1000,
+  /** Absolute path of the real sudo; empty means "resolve on a trusted path". */
+  sudoPath: '',
 })
 
 /**
@@ -105,6 +128,14 @@ const MESSAGES = Object.freeze({
   timeout: (seconds) => `sudo 审批：${seconds} 秒内没有收到确认，已拒绝执行。`,
   invalidPassword: 'sudo 审批：密码校验未通过。',
   internal: (detail) => `sudo 审批插件内部错误，已拒绝执行：${detail}`,
+  /** The panel may not show everything, so it refuses instead of hiding a tail. */
+  truncated: (lines, width) =>
+    `sudo 审批：该命令超出面板可完整显示的长度（最多 ${lines} 行、单行 ${width} 字符），为避免你批准看不见的内容，已拒绝执行。请把命令拆成更短的几条、或把长内容写进脚本文件后只调用脚本。`,
+  /** The approval record does not describe the call that is about to run. */
+  mismatch: 'sudo 审批：批准记录与本次调用不匹配（会话、调用或命令内容已变化），已拒绝执行。请重新发起一次 sudo 调用。',
+  /** `credential: timestamp` was configured but the cache cannot be reused here. */
+  credential:
+    'sudo 审批：配置要求用 sudo 时间戳缓存交付密码，但本机的 sudo 缓存无法被后续命令复用（无 tty 时按 tty/session 记账），已拒绝执行。请把 credential 改回 auto 或 askpass。',
 })
 
 /** `true` for plain JSON-ish objects. */
@@ -128,17 +159,41 @@ function normalizeReason(value) {
   return text.length > 200 ? `${text.slice(0, 200)}…` : text
 }
 
-/** Keep only well-typed editable settings; ranges are clamped when resolved. */
+/**
+ * Keep only well-typed values from the settings file. Security-relevant keys
+ * are accepted here on purpose: the file is the documented way to change them,
+ * while the HTTP route below deliberately cannot.
+ */
 function sanitizePatch(raw) {
   const patch = {}
   if (!isPlainObject(raw)) return patch
   if (typeof raw.enabled === 'boolean') patch.enabled = raw.enabled
   if (raw.remember === 'never' || raw.remember === 'session') patch.remember = raw.remember
+  if (raw.credential === 'auto' || raw.credential === 'askpass' || raw.credential === 'timestamp') {
+    patch.credential = raw.credential
+  }
+  if (typeof raw.sudoPath === 'string' && raw.sudoPath !== '') patch.sudoPath = raw.sudoPath
   if (typeof raw.timeoutMs === 'number' && Number.isFinite(raw.timeoutMs)) patch.timeoutMs = Math.round(raw.timeoutMs)
   if (typeof raw.presenceWindowMs === 'number' && Number.isFinite(raw.presenceWindowMs)) {
     patch.presenceWindowMs = Math.round(raw.presenceWindowMs)
   }
   if (typeof raw.allowRemoteDeployment === 'boolean') patch.allowRemoteDeployment = raw.allowRemoteDeployment
+  return patch
+}
+
+/**
+ * The subset the browser may change. `enabled`, `remember`, `credential`,
+ * `allowRemoteDeployment` and `sudoPath` decide what the gate does, so a page
+ * (or any script running in it) must not be able to flip them: they stay
+ * file-only.
+ */
+function sanitizeRuntimePatch(raw) {
+  const patch = {}
+  if (!isPlainObject(raw)) return patch
+  if (typeof raw.timeoutMs === 'number' && Number.isFinite(raw.timeoutMs)) patch.timeoutMs = Math.round(raw.timeoutMs)
+  if (typeof raw.presenceWindowMs === 'number' && Number.isFinite(raw.presenceWindowMs)) {
+    patch.presenceWindowMs = Math.round(raw.presenceWindowMs)
+  }
   return patch
 }
 
@@ -157,11 +212,13 @@ function resolveConfig(raw) {
   return {
     enabled: input.enabled !== false,
     remember: input.remember === 'session' ? 'session' : 'never',
+    credential: input.credential === 'askpass' || input.credential === 'timestamp' ? input.credential : 'auto',
     timeoutMs: clamp(input.timeoutMs, LIMITS.timeoutMs, DEFAULTS.timeoutMs),
     presenceWindowMs: clamp(input.presenceWindowMs, LIMITS.presenceWindowMs, DEFAULTS.presenceWindowMs),
-    memoryTtlMs: clamp(input.memoryTtlMs, LIMITS.timeoutMs, DEFAULTS.memoryTtlMs),
+    memoryTtlMs: clamp(input.memoryTtlMs, LIMITS.memoryTtlMs, DEFAULTS.memoryTtlMs),
     toolNames: new Set(toolNames.length > 0 ? toolNames : [...DEFAULTS.toolNames]),
     allowRemoteDeployment: input.allowRemoteDeployment === true,
+    sudoPath: typeof input.sudoPath === 'string' ? input.sudoPath : '',
   }
 }
 
@@ -185,8 +242,13 @@ const MAX_DISPLAY_WIDTH = 400
 
 /**
  * Turn a bash command into the lines the panel lists.
+ *
+ * `truncated` is a security fact, not a display detail: an approval covers the
+ * whole command string, so a command the panel cannot show in full must never
+ * be approved — the caller refuses it instead.
  * @param command - the tool's `command` argument.
- * @returns the displayed items and whether any of them needs real authority.
+ * @returns the displayed items, whether any of them needs real authority, and
+ *   whether the panel would be hiding part of the command.
  */
 function analyzeCommand(command) {
   const items = []
@@ -200,6 +262,7 @@ function analyzeCommand(command) {
     }
     // A whole-line shell comment can never execute, so it never asks.
     const sudo = !text.startsWith('#') && SUDO_TOKEN.test(text)
+    if (text.length > MAX_DISPLAY_WIDTH) truncated = true
     items.push({
       text: text.length > MAX_DISPLAY_WIDTH ? `${text.slice(0, MAX_DISPLAY_WIDTH)}…` : text,
       sudo,
@@ -207,23 +270,41 @@ function analyzeCommand(command) {
       privileged: sudo && !METADATA_ONLY_SUDO.test(text),
     })
   }
-  if (truncated) items.push({ text: `…（仅显示前 ${MAX_DISPLAY_LINES} 行）`, sudo: false, privileged: false, note: true })
-  return { items, hasSudo: items.some((item) => item.privileged) }
+  if (truncated) items.push({ text: `…（仅显示前 ${MAX_DISPLAY_LINES} 行 / 每行 ${MAX_DISPLAY_WIDTH} 字符）`, sudo: false, privileged: false, note: true })
+  return {
+    items,
+    hasSudo: items.some((item) => item.privileged),
+    truncated,
+    digest: digestOf(command),
+  }
+}
+
+/** Stable short fingerprint of a command string, for the audit log and `armed`. */
+function digestOf(command) {
+  return createHash('sha256').update(command, 'utf8').digest('hex').slice(0, 16)
 }
 
 /**
- * Find an executable on a PATH string without executing anything.
- * @param name - file name to look for.
- * @param searchPath - colon separated directories.
- * @returns the absolute path, or undefined.
+ * Find the real sudo on a trusted path.
+ *
+ * `sudo` is normally a symlink (`/usr/bin/sudo -> /etc/alternatives/sudo`), so
+ * the link target is what runs and what must be root-owned and not group- or
+ * world-writable. A config `sudoPath` overrides the candidates but is checked
+ * the same way; anything that fails validation leaves the plugin inactive.
+ * @param configured - a config-supplied absolute path, if any.
+ * @param candidates - fallback list, already absolute.
+ * @returns `{ path }` for the real binary, or undefined.
  */
-function findExecutable(name, searchPath) {
-  for (const dir of searchPath.split(':')) {
-    if (dir === '') continue
-    const candidate = join(dir, name)
+function resolveTrusted(configured, candidates) {
+  const list = configured === '' ? candidates : [configured, ...candidates]
+  for (const candidate of list) {
     try {
-      const stat = statSync(candidate)
-      if (stat.isFile() && (stat.mode & 0o111) !== 0) return candidate
+      const real = realpathSync(candidate)
+      const stat = statSync(real)
+      if (!stat.isFile()) continue
+      if (stat.uid !== 0) continue
+      if ((stat.mode & 0o022) !== 0) continue
+      return { path: real, link: candidate }
     } catch {
       // keep looking
     }
@@ -256,8 +337,8 @@ export function apply(ctx, rawConfig) {
   /** Live config: install-time values under the saved settings. */
   let config = resolveConfig({ ...installConfig, ...overrides })
   const basePath = process.env.PATH ?? FALLBACK_PATH
-  const realSudo = findExecutable('sudo', basePath)
-  const realSudoedit = findExecutable('sudoedit', basePath)
+  const realSudo = resolveTrusted(config.sudoPath, SUDO_CANDIDATES)
+  const realSudoedit = resolveTrusted('', SUDOEDIT_CANDIDATES)
 
   /** Append one sanitized audit line; never receives a password. */
   function audit(event) {
@@ -272,7 +353,7 @@ export function apply(ctx, rawConfig) {
   }
 
   if (realSudo === undefined) {
-    audit({ event: 'inactive', reason: 'sudo-not-found' })
+    audit({ event: 'inactive', reason: 'sudo-not-trusted' })
     return
   }
 
@@ -280,19 +361,22 @@ export function apply(ctx, rawConfig) {
   let inflight
   /** Requests waiting for their turn, oldest first; `inflight` is not in here. */
   const queue = []
-  /** callId → validated password, released by the matching dispatch. */
+  /** `${sessionId}:${callId}` → validated secret for one dispatch. */
   const armed = new Map()
   /** sessionId → { secret, usedAt } in `remember` mode. */
   const remembered = new Map()
   /** Timestamp of the last page poll; 0 means no page has ever polled. */
   let lastPollAt = 0
+  /** Timestamp of the last poll from a *visible* page. */
+  let lastVisibleAt = 0
+  /** Timestamp of the last real user gesture reported by the page. */
+  let lastInteractionAt = 0
   /**
-   * Live shim installs, newest first. Several approved commands may run at the
-   * same time — parallel native calls, concurrent PTC sub-calls — so each
-   * install keeps its own directory, its own shim and its own askpass helper,
-   * and PATH lists every live one instead of being overwritten by the last.
+   * Live shim installs. A shim never touches `process.env`: it is handed to one
+   * spawn only, through `spec.env`, so an approved command cannot lend its
+   * password to a concurrent session, subagent or background job.
    */
-  const shims = []
+  const approvalScope = new AsyncLocalStorage()
   /**
    * `run_code` token → the moment its dispatch started. A program's elapsed
    * budget is fixed at that point, so this is what lets a nested request size
@@ -300,7 +384,14 @@ export function apply(ctx, rawConfig) {
    */
   const ptcParents = new Map()
 
-  audit({ event: 'loaded', build: BUILD, remember: config.remember, timeoutMs: config.timeoutMs, sudo: realSudo })
+  audit({
+    event: 'loaded',
+    build: BUILD,
+    remember: config.remember,
+    credential: config.credential,
+    timeoutMs: config.timeoutMs,
+    sudo: realSudo.path,
+  })
 
   // ---------------------------------------------------------- settings ----
   /** Recompute live config, dropping remembered secrets that no longer apply. */
@@ -335,26 +426,59 @@ export function apply(ctx, rawConfig) {
       store: storePath,
       auditLog,
       limits: { timeoutMs: LIMITS.timeoutMs, presenceWindowMs: LIMITS.presenceWindowMs },
+      /** Keys the page shows but cannot change; edit the config or the store. */
+      readOnly: ['enabled', 'remember', 'credential', 'allowRemoteDeployment', 'sudoPath'],
       values: {
         enabled: config.enabled,
         remember: config.remember,
+        credential: config.credential,
         timeoutMs: config.timeoutMs,
         presenceWindowMs: config.presenceWindowMs,
         allowRemoteDeployment: config.allowRemoteDeployment,
       },
+      sudo: realSudo.path,
       install: sanitizePatch(installConfig),
       overrides: { ...overrides },
     }
   }
 
   // ------------------------------------------------------------- env ------
-  /** Rebuild PATH from the live shim directories over the inherited PATH. */
-  function syncPath() {
-    const dirs = shims.map((run) => run.bin).filter((bin) => typeof bin === 'string')
-    process.env.PATH = dirs.length === 0 ? basePath : `${basePath === '' ? '' : `${dirs.join(':')}:`}${basePath}`
+  /** Shim installs that still own a directory; cleaned on unload or exit. */
+  const liveRuns = new Set()
+  /**
+   * Installs that had to fall back to a process-wide `PATH` because the shell
+   * service refused to be wrapped. Kept so the fallback can still be undone.
+   */
+  const globalRuns = []
+  /** Whether the shim is delivered per spawn instead of through `process.env`. */
+  let scopedShims = false
+
+  /** Rebuild the process-wide PATH from the fallback installs, oldest last. */
+  function syncGlobalPath() {
+    process.env.PATH = globalRuns.length === 0 ? basePath : `${globalRuns.map((run) => run.bin).join(':')}:${basePath}`
   }
 
-  /** Put one PATH shim and askpass helper in front of the inherited env. */
+  /** The restricted environment `sudo` itself is invoked with. */
+  function sudoEnv() {
+    return {
+      PATH: basePath,
+      HOME: process.env.HOME ?? '',
+      USER: process.env.USER ?? '',
+      LOGNAME: process.env.LOGNAME ?? process.env.USER ?? '',
+      SHELL: process.env.SHELL ?? '/bin/sh',
+      TERM: 'dumb',
+      LANG: 'C',
+      LC_ALL: 'C',
+    }
+  }
+
+  /**
+   * Put one PATH shim and askpass helper in a private directory.
+   *
+   * Nothing global is mutated when scoped delivery is available: the directory
+   * is named only in the `PATH` of the one spawn it was built for, so the
+   * password cannot leak into a concurrent session, subagent or background job.
+   */
   async function materialize(secret) {
     const root = await mkdtemp(join(process.env.XDG_RUNTIME_DIR || tmpdir(), `${NAME}-`))
     const run = { root }
@@ -369,16 +493,21 @@ export function apply(ctx, rawConfig) {
       await writeFile(askpass, `#!/bin/sh\nexec cat "${passwordFile}"\n`, { mode: 0o700 })
       await chmod(askpass, 0o700)
       const shim = (target) => SUDO_SHIM.replaceAll('@SUDO@', target).replaceAll('@ASKPASS@', askpass)
-      await writeFile(join(bin, 'sudo'), shim(realSudo), { mode: 0o700 })
+      await writeFile(join(bin, 'sudo'), shim(realSudo.path), { mode: 0o700 })
       await chmod(join(bin, 'sudo'), 0o700)
       if (realSudoedit !== undefined) {
-        await writeFile(join(bin, 'sudoedit'), shim(realSudoedit), { mode: 0o700 })
+        await writeFile(join(bin, 'sudoedit'), shim(realSudoedit.path), { mode: 0o700 })
         await chmod(join(bin, 'sudoedit'), 0o700)
       }
       run.bin = bin
       run.askpass = askpass
-      shims.unshift(run)
-      syncPath()
+      liveRuns.add(run)
+      if (!scopedShims) {
+        // Degraded: the shell service could not be wrapped, so the shim has to
+        // ride the process environment. Audited so the difference is visible.
+        globalRuns.push(run)
+        syncGlobalPath()
+      }
       return run
     } catch (error) {
       await dematerialize(run)
@@ -386,21 +515,25 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  /** Drop one shim from PATH and delete its directory, leaving the others live. */
+  /** Delete one shim directory and forget it. */
   async function dematerialize(run) {
-    const index = run === undefined ? -1 : shims.indexOf(run)
+    if (run === undefined) return
+    liveRuns.delete(run)
+    const index = globalRuns.indexOf(run)
     if (index >= 0) {
-      shims.splice(index, 1)
-      syncPath()
+      globalRuns.splice(index, 1)
+      syncGlobalPath()
     }
-    if (run?.root === undefined) return
+    if (run.root === undefined) return
     await rm(run.root, { recursive: true, force: true }).catch(() => {})
   }
 
   /** Synchronous last-resort cleanup for process exit and plugin unload. */
   function hardCleanup() {
-    const runs = shims.splice(0, shims.length)
-    syncPath()
+    const runs = [...liveRuns]
+    liveRuns.clear()
+    globalRuns.length = 0
+    syncGlobalPath()
     for (const run of runs) {
       try {
         rmSync(run.root, { recursive: true, force: true })
@@ -409,6 +542,79 @@ export function apply(ctx, rawConfig) {
       }
     }
   }
+
+  /**
+   * Delete shim directories a crashed Host left behind. They hold a plaintext
+   * password, so a stale one must not survive the next start; the age guard
+   * keeps a concurrently starting Host's fresh directory untouched.
+   */
+  function sweepStaleRuns() {
+    const parent = process.env.XDG_RUNTIME_DIR || tmpdir()
+    let entries
+    try {
+      entries = readdirSync(parent)
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (!entry.startsWith(`${NAME}-`)) continue
+      const target = join(parent, entry)
+      try {
+        const stat = statSync(target)
+        if (!stat.isDirectory()) continue
+        if (Date.now() - stat.mtimeMs < 60_000) continue
+        rmSync(target, { recursive: true, force: true })
+        audit({ event: 'stale-cleanup', path: target })
+      } catch {
+        // best effort
+      }
+    }
+  }
+
+  /**
+   * Teach the shell service to deliver a shim to one spawn.
+   *
+   * The bash tool asks `ctx.shell.resolve()` for a fully specified spec and then
+   * spawns it with `spec.env`; wrapping `resolve` therefore lets this plugin put
+   * its `PATH` on exactly the spawn the user approved. The approval travels in
+   * an AsyncLocalStorage store set by the `tools/execute` hook, which is what
+   * keeps two concurrent approvals from seeing each other's shim.
+   */
+  ctx.effect(() => {
+    let restore
+    const scope = ctx.inject(['shell'], (child) => {
+      const shell = child.get('shell')
+      if (shell === undefined || typeof shell.resolve !== 'function') return
+      const original = shell.resolve
+      const patched = function resolve(request) {
+        const spec = original.call(this, request)
+        const run = approvalScope.getStore()
+        if (run === undefined || typeof run.bin !== 'string') return spec
+        const inherited = isPlainObject(spec.env) && typeof spec.env.PATH === 'string' ? spec.env.PATH : basePath
+        return {
+          ...spec,
+          env: { ...(isPlainObject(spec.env) ? spec.env : {}), PATH: `${run.bin}:${inherited}` },
+        }
+      }
+      try {
+        shell.resolve = patched
+        if (shell.resolve !== patched) throw new Error('shell.resolve is not replaceable')
+        scopedShims = true
+        restore = () => {
+          if (shell.resolve === patched) shell.resolve = original
+          scopedShims = false
+        }
+      } catch (error) {
+        audit({ event: 'shim-global', reason: 'shell-not-wrappable', message: errorText(error) })
+      }
+    })
+    return () => {
+      restore?.()
+      scope?.dispose?.()
+    }
+  }, `${NAME}: scoped shim`)
+
+  sweepStaleRuns()
 
   /**
    * Validate a password with one non-interactive `sudo -S -v` attempt.
@@ -431,18 +637,9 @@ export function apply(ctx, rawConfig) {
       }
       let child
       try {
-        child = spawn(realSudo, ['-k', '-S', '-v'], {
+        child = spawn(realSudo.path, ['-k', '-S', '-v'], {
           stdio: ['pipe', 'ignore', 'ignore'],
-          env: {
-            PATH: basePath,
-            HOME: process.env.HOME ?? '',
-            USER: process.env.USER ?? '',
-            LOGNAME: process.env.LOGNAME ?? process.env.USER ?? '',
-            SHELL: process.env.SHELL ?? '/bin/sh',
-            TERM: 'dumb',
-            LANG: 'C',
-            LC_ALL: 'C',
-          },
+          env: sudoEnv(),
         })
       } catch {
         finish(false)
@@ -457,6 +654,52 @@ export function apply(ctx, rawConfig) {
       child.stdin.on('error', () => {})
       child.stdin.end(`${secret}\n`)
     })
+  }
+
+  /** Run one non-interactive sudo probe; resolves with its exit status. */
+  function probeSudo(args, timeoutMs) {
+    return new Promise((resolve) => {
+      let settled = false
+      const finish = (value) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(value)
+      }
+      let child
+      try {
+        child = spawn(realSudo.path, args, { stdio: ['ignore', 'ignore', 'ignore'], env: sudoEnv() })
+      } catch {
+        finish(false)
+        return
+      }
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL')
+        finish(false)
+      }, timeoutMs)
+      child.on('error', () => finish(false))
+      child.on('close', (code) => finish(code === 0))
+    })
+  }
+
+  /**
+   * Whether the credential cache a validated password leaves behind can be
+   * reused by the command itself.
+   *
+   * It cannot on a default `timestamp_type=tty` setup: the validation runs with
+   * no controlling terminal, so the record is filed under a key the command's
+   * own (equally tty-less) sudo does not look up. A false answer is normal and
+   * is what sends `auto` to the askpass shim; a true answer means no shim and no
+   * password file are needed at all.
+   * @returns whether `sudo -n` already works without a password.
+   */
+  function timestampUsable() {
+    return probeSudo(['-n', '-v'], 5_000)
+  }
+
+  /** Drop the invoking user's cached sudo credential; best effort. */
+  function clearTimestamp() {
+    return probeSudo(['-k'], 5_000)
   }
 
   // ------------------------------------------------------- pre-execute ----
@@ -526,9 +769,27 @@ export function apply(ctx, rawConfig) {
     return { waitMs: Math.min(config.timeoutMs, Math.floor(left)), deadlineAt }
   }
 
-  /** Whether a page has polled recently enough to show a panel. */
+  /** Whether a visible page has polled recently enough to show a panel. */
   function pagePresent() {
-    return lastPollAt !== 0 && Date.now() - lastPollAt <= config.presenceWindowMs
+    const now = Date.now()
+    if (lastPollAt === 0 || now - lastPollAt > config.presenceWindowMs) return false
+    // A hidden tab keeps polling exactly like a visible one, so the page has to
+    // report that it is on screen before it can be treated as somebody watching.
+    return lastVisibleAt !== 0 && now - lastVisibleAt <= config.presenceWindowMs
+  }
+
+  /** Whether the page reported a real user gesture (click, key, focus) lately. */
+  function interactionPresent() {
+    return lastInteractionAt !== 0 && Date.now() - lastInteractionAt <= config.presenceWindowMs
+  }
+
+  /**
+   * Approval key for one dispatch. A provider's `callId` is only unique within
+   * its own conversation, so the session has to be part of the key: otherwise a
+   * collision in another session would inherit this approval.
+   */
+  function armKey(exec) {
+    return `${exec.agent === undefined ? '?' : exec.agent.id}:${exec.callId}`
   }
 
   /** Put one request on screen: fix its deadline, log it, start its timer. */
@@ -702,7 +963,6 @@ export function apply(ctx, rawConfig) {
       audit({ event: 'denied', reason: 'no-client', sessionId: exec.agent.id })
       return { kind: 'deny', reason: MESSAGES.noClient }
     }
-
     // A PTC sub-dispatch is how that presentation reaches any tool, so it is a
     // normal path rather than a nested bypass: the password is still required.
     // What differs is the wait, which has to fit inside the program's budget.
@@ -717,8 +977,15 @@ export function apply(ctx, rawConfig) {
 
     const { request, decision } = await askForApproval(exec, analysis, plan)
     if (decision.kind === 'approved' && typeof decision.secret === 'string' && decision.secret !== '') {
-      armed.set(exec.callId, { secret: decision.secret, at: Date.now() })
-      audit({ event: 'approved', id: request.id, sessionId: request.sessionId, callId: request.callId })
+      armed.set(armKey(exec), {
+        secret: decision.secret,
+        at: Date.now(),
+        sessionId: exec.agent.id,
+        // The secret is released only to a dispatch whose command still hashes
+        // to what the user was shown.
+        digest: digestOf(typeof exec.arguments.command === 'string' ? exec.arguments.command : ''),
+      })
+      audit({ event: 'approved', id: request.id, sessionId: request.sessionId, callId: request.callId, digest: analysis.digest })
       return undefined
     }
     if (decision.kind === 'rejected') {
@@ -748,6 +1015,18 @@ export function apply(ctx, rawConfig) {
     const args = exec.arguments
     if (!isPlainObject(args) || typeof args.command !== 'string' || args.command === '') return undefined
     const analysis = analyzeCommand(args.command)
+    // A sudo call can sit past the display cap, where neither the panel nor the
+    // per-line scan can see it, so the whole string is scanned before this
+    // command is written off as needing no gate at all.
+    const mentionsSudo = SUDO_TOKEN.test(args.command)
+    if (!analysis.hasSudo && !mentionsSudo) return undefined
+    // An approval covers the whole command string, so a command the panel could
+    // not show in full is refused rather than approved blind.
+    if (analysis.truncated) {
+      audit({ event: 'denied', reason: 'truncated', sessionId: exec.agent.id, callId: exec.callId, digest: analysis.digest })
+      return { kind: 'deny', reason: MESSAGES.truncated(MAX_DISPLAY_LINES, MAX_DISPLAY_WIDTH) }
+    }
+    // The token only appeared in comments or in a form that never authenticates.
     if (!analysis.hasSudo) return undefined
     return decide(exec, analysis)
   }
@@ -769,6 +1048,7 @@ export function apply(ctx, rawConfig) {
   // opening sentence (how to get to sudo at all) depends on the presentation.
   const SUDO_RULES = [
     'Write it plainly (`sudo <command>`) — the approved call authenticates by itself, so never pass a password, pipe one in, or add `-n`/`-S`/askpass flags; `sudo -n` always fails here.',
+    'Keep the whole command short: the panel shows at most 60 lines and 400 characters per line, and a command that would not fit is refused outright instead of being approved blind — split it up, or put the long part in a script file and call that.',
     'One approval covers the whole command string, so keep sudo lines few and short. A rejection may quote the user\u2019s reason: do not retry the same command unchanged.',
     'Approvals are handled one at a time in arrival order: a parallel sudo call waits in line instead of failing, but each wait delays the command behind it, so keep sudo calls sequential and few. `sudo -k`, `-K`, `-V` and `-h` alone need no approval; sudo is unavailable in subagents and background jobs.',
   ].join(' ')
@@ -828,6 +1108,47 @@ export function apply(ctx, rawConfig) {
   }, `${NAME}: context`)
 
   // ----------------------------------------------------------- execute ----
+  /**
+   * Hand one validated secret to exactly one dispatch.
+   *
+   * Two deliveries are possible. When the sudo credential cache is reusable the
+   * command needs no help at all: it runs untouched and the cache is dropped
+   * afterwards. Otherwise a shim is built for this dispatch and injected through
+   * the spec of its spawn only, so no other process can inherit the password.
+   * @param exec - the tool call being dispatched.
+   * @param secret - the validated password.
+   * @param next - the rest of the middleware chain.
+   */
+  async function dispatchWithSecret(exec, secret, next) {
+    if (config.credential !== 'askpass' && (await timestampUsable())) {
+      audit({ event: 'execute', callId: exec.callId, credential: 'timestamp' })
+      try {
+        return await next()
+      } finally {
+        await clearTimestamp()
+        audit({ event: 'finished', callId: exec.callId })
+      }
+    }
+    if (config.credential === 'timestamp') {
+      audit({ event: 'denied', reason: 'credential-unavailable', callId: exec.callId })
+      throw new Error(MESSAGES.credential)
+    }
+    let run
+    try {
+      run = await materialize(secret)
+    } catch (error) {
+      audit({ event: 'shim-error', callId: exec.callId, message: errorText(error) })
+      return next()
+    }
+    audit({ event: 'execute', callId: exec.callId, credential: 'askpass', scoped: scopedShims })
+    try {
+      return await approvalScope.run(run, () => next())
+    } finally {
+      await dematerialize(run)
+      audit({ event: 'finished', callId: exec.callId })
+    }
+  }
+
   ctx.on('tools/execute', async (exec, next) => {
     // Time a PTC program from the moment its dispatch starts: its budget is
     // fixed here, and a nested sudo request later needs what is left of it.
@@ -839,23 +1160,16 @@ export function apply(ctx, rawConfig) {
         ptcParents.delete(exec.token)
       }
     }
-    const entry = armed.get(exec.callId)
+    const key = armKey(exec)
+    const entry = armed.get(key)
     if (entry === undefined) return next()
-    armed.delete(exec.callId)
-    let run
-    try {
-      run = await materialize(entry.secret)
-    } catch (error) {
-      audit({ event: 'shim-error', callId: exec.callId, message: errorText(error) })
-      return next()
+    armed.delete(key)
+    const command = isPlainObject(exec.arguments) && typeof exec.arguments.command === 'string' ? exec.arguments.command : undefined
+    if (entry.digest !== undefined && command !== undefined && digestOf(command) !== entry.digest) {
+      audit({ event: 'armed-mismatch', callId: exec.callId, sessionId: entry.sessionId })
+      throw new Error(MESSAGES.mismatch)
     }
-    audit({ event: 'execute', callId: exec.callId })
-    try {
-      return await next()
-    } finally {
-      await dematerialize(run)
-      audit({ event: 'finished', callId: exec.callId })
-    }
+    return dispatchWithSecret(exec, entry.secret, next)
   })
 
   // ------------------------------------------------------------- routes ---
@@ -874,6 +1188,28 @@ export function apply(ctx, rawConfig) {
   const respondJson = (payload, status = 200) =>
     Response.json(payload, { status, headers: { 'cache-control': 'no-store' } })
 
+  /**
+   * Record how the page presented itself on this request.
+   *
+   * `state=visible` and `interaction=1` are claims made by the page, so they are
+   * a speed bump rather than a proof: they stop a hidden tab from counting as
+   * somebody watching, and they make an approval carry the click that produced
+   * it. A script that holds a session cookie can still assert both; that is why
+   * the security-relevant switches are file-only.
+   */
+  function notePresence(request) {
+    const now = Date.now()
+    lastPollAt = now
+    let url
+    try {
+      url = new URL(request.url)
+    } catch {
+      return
+    }
+    if (url.searchParams.get('state') === 'visible') lastVisibleAt = now
+    if (url.searchParams.get('interaction') === '1') lastInteractionAt = now
+  }
+
   /** Answer the page's approve/reject click. */
   async function respond(body) {
     const id = typeof body?.id === 'string' ? body.id : undefined
@@ -891,6 +1227,14 @@ export function apply(ctx, rawConfig) {
     if (decision === 'reject') {
       request.settle?.({ kind: 'rejected', reason: normalizeReason(body?.reason) })
       return respondJson({ ok: true, value: { state: 'rejected' } })
+    }
+    // An approval has to carry the click that produced it.
+    if (body?.interaction !== true || !interactionPresent()) {
+      audit({ event: 'denied', reason: 'no-interaction', id: request.id, sessionId: request.sessionId })
+      return respondJson(
+        { ok: false, error: { code: 'sudo-approve/no-interaction', message: 'approval requires a fresh user interaction on this page' } },
+        403,
+      )
     }
     request.resolving = true
     try {
@@ -922,8 +1266,8 @@ export function apply(ctx, rawConfig) {
         path: `${ROUTE_PREFIX}/pending`,
         methods: ['GET'],
         requestBody: 'buffered',
-        fetch: async () => {
-          lastPollAt = Date.now()
+        fetch: async (request) => {
+          notePresence(request)
           return respondJson({ ok: true, value: snapshot() })
         },
       })
@@ -932,7 +1276,7 @@ export function apply(ctx, rawConfig) {
         methods: ['POST'],
         requestBody: 'buffered',
         fetch: async (request) => {
-          lastPollAt = Date.now()
+          notePresence(request)
           let body
           try {
             body = await request.json()
@@ -961,7 +1305,9 @@ export function apply(ctx, rawConfig) {
             audit({ event: 'configured', reset: true })
             return respondJson({ ok: true, value: settingsSnapshot() })
           }
-          const patch = sanitizePatch(body?.patch)
+          // Only the two timing knobs are page-editable; everything that
+          // decides what the gate does is file-only by design.
+          const patch = sanitizeRuntimePatch(body?.patch)
           if (Object.keys(patch).length === 0) {
             return respondJson({ ok: false, error: { code: 'sudo-approve/bad-request', message: 'no editable setting' } }, 400)
           }
