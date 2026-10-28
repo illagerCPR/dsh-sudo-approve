@@ -141,13 +141,22 @@ export function apply(ctx, rawConfig) {
     // what will collect the password rather than just "native".
     dialogBinary: dialogFacts.chooser?.path,
   })
-  // Ask as soon as the registry appears; the lifecycle loop retries, for the case
-  // where it was already up and `inject` has nothing to wait for.
+  // The registry service comes up before its tools do: the first boot of this
+  // build read it 38 ms after apply and got an empty list. So ask again soon
+  // after, and keep asking on the lifecycle loop until an answer is real.
   ctx.effect(() => {
     const scope = ctx.inject(['tools'], () => {
       coverageOf()
     })
-    return () => scope?.dispose?.()
+    const timers = [2_000, 8_000].map((delay) =>
+      setTimeout(() => {
+        if (!coverageAudited) coverageOf()
+      }, delay),
+    )
+    return () => {
+      scope?.dispose?.()
+      for (const timer of timers) clearTimeout(timer)
+    }
   }, `${NAME}: coverage`)
 
   /** sessionId → { secret, usedAt } in `remember` mode. */
