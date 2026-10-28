@@ -82,9 +82,13 @@ window.__ModuleLoader__.load({
       settingsRemote: '允许远程部署接收密码',
       settingsRemoteHint: '开启后，通过非回环地址连接的浏览器也能提交密码；明文网络路径上有风险。',
       settingsCoverage: '审批覆盖的工具',
-      settingsCoverageHint: '审批只拦截 bash。宿主里若还有其他能执行命令的工具，它们不会被拦下，这里会把它们点名列出。',
+      settingsCoverageHint: '审批只拦截 bash。宿主里若还有其他能执行命令的工具，它们不会被拦下，这里会把它们点名列出；PTC 模式的程序通道另起一行。',
       coverageAll: '仅 bash（清单共 {n} 个工具，未发现其他能执行命令的）',
+      coverageWithPrograms: '仅 bash（清单共 {n} 个工具）；另有 PTC 程序通道',
       coverageUnknown: '—（工具清单还没就绪）',
+      settingsPrograms: 'PTC 程序通道',
+      settingsProgramsHint: 'PTC 模式下，模型写的程序本身就能起进程（例如导入子进程模块），这些调用不经过审批面板，也不会留审计记录。会话是 danger-full-access 时，程序可能借此执行 sudo。',
+      programsRunCode: 'run_code：可直接起进程',
       settingsReset: '恢复超时与在线窗口',
       settingsResetDone: '已恢复超时与在线窗口；安全开关（启用、授权粒度、凭据方式）不受影响',
       settingsSaved: '已保存',
@@ -153,9 +157,13 @@ window.__ModuleLoader__.load({
       settingsRemote: 'Accept passwords from remote deployments',
       settingsRemoteHint: 'Lets a browser connected over a non-loopback address submit the password, which is risky on a plaintext path.',
       settingsCoverage: 'Tools under approval',
-      settingsCoverageHint: 'Approval gates bash only. Any other tool in this host that can run commands is not gated, and is named here.',
+      settingsCoverageHint: 'Approval gates bash only. Any other tool in this host that can run commands is not gated, and is named here; the PTC program channel gets its own row.',
       coverageAll: 'bash only (of the {n} tools in the list, none other runs commands)',
+      coverageWithPrograms: 'bash only (of the {n} tools in the list); plus the PTC program channel',
       coverageUnknown: '— (the tool list is not ready yet)',
+      settingsPrograms: 'PTC program channel',
+      settingsProgramsHint: 'Under PTC mode the model writes a program that can spawn processes itself (for example by importing the child-process module). Those calls never reach the approval panel and leave no audit line; with a danger-full-access session, such a program may run sudo that way.',
+      programsRunCode: 'run_code: can spawn processes',
       settingsReset: 'Restore timing defaults',
       settingsResetDone: 'Timing defaults restored; the security switches (enabled, password scope, credential) are untouched',
       settingsSaved: 'Saved',
@@ -774,11 +782,18 @@ window.__ModuleLoader__.load({
       const uncoveredNames = Array.isArray(coverageInfo.uncovered)
         ? coverageInfo.uncovered.map((entry) => (typeof entry === 'string' ? entry : entry?.name)).filter(Boolean)
         : []
+      // A PTC transport in the registry means programs are running commands that
+      // no tool-level allowlist can see; that is a second row of its own, not an
+      // "uncovered tool" (its payload is code, not a command line).
+      const coveragePrograms = Array.isArray(coverageInfo.programs) ? coverageInfo.programs.filter(Boolean) : []
       const coverageValue =
         coverageInfo.available !== true
           ? t('coverageUnknown')
           : uncoveredNames.length === 0
-            ? t('coverageAll').replace('{n}', String(coverageInfo.total ?? 0))
+            ? (coveragePrograms.length === 0 ? t('coverageAll') : t('coverageWithPrograms')).replace(
+                '{n}',
+                String(coverageInfo.total ?? 0),
+              )
             : uncoveredNames.join('、')
 
       const rememberRow = readonlyRow(
@@ -811,6 +826,9 @@ window.__ModuleLoader__.load({
         rememberRow,
         readonlyRow('dialog', t('settingsDialog'), dialogHint, dialogValue),
         readonlyRow('coverage', t('settingsCoverage'), t('settingsCoverageHint'), coverageValue),
+        coveragePrograms.length === 0
+          ? null
+          : readonlyRow('programs', t('settingsPrograms'), t('settingsProgramsHint'), t('programsRunCode')),
         numberRow('timeout', t('settingsTimeout'), t('settingsTimeoutHint'), 'timeoutMs', limits.timeoutMs),
         numberRow(
           'presence',

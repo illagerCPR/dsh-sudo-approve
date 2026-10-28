@@ -44,7 +44,7 @@ import { errorText, isPlainObject } from './lib/util.js'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 19
+const BUILD = 20
 /** Fallback PATH when the Host process has none. */
 const FALLBACK_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
@@ -145,6 +145,10 @@ export function apply(ctx, rawConfig) {
         tools: report.total,
         covered: report.covered,
         uncovered: report.uncovered,
+        // The PTC transport is a command surface the name/field heuristic cannot
+        // classify; naming it here keeps "covered: bash" from reading like "the
+        // only way to run a command".
+        ...(report.programs.length > 0 ? { programs: report.programs } : {}),
       })
     }
     return report
