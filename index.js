@@ -23,7 +23,6 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -38,52 +37,27 @@ import { installPrompt } from './lib/prompt.js'
 import { installRoutes } from './lib/routes.js'
 import { createShim } from './lib/shim.js'
 import { createSudoAuth } from './lib/sudo-auth.js'
+import { resolveTrusted } from './lib/trusted.js'
 import { errorText, isPlainObject } from './lib/util.js'
 
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 16
+const BUILD = 17
 /** Fallback PATH when the Host process has none. */
 const FALLBACK_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 /**
- * Candidates for the real sudo. Resolution is confined to root-owned locations
- * and re-validated after `realpath`, because the password is handed to whatever
+ * Candidates for the real sudo.
+ *
+ * Resolution is confined to root-owned locations and re-validated after
+ * `realpath` (see `lib/trusted`), because the password is handed to whatever
  * binary this ends up naming: a writable directory on `PATH` must never be able
  * to answer that question.
  */
 const SUDO_CANDIDATES = Object.freeze(['/usr/bin/sudo', '/bin/sudo'])
 /** The same treatment for sudoedit, which the shim also shadows. */
 const SUDOEDIT_CANDIDATES = Object.freeze(['/usr/bin/sudoedit', '/bin/sudoedit'])
-
-/**
- * Find the real sudo on a trusted path.
- *
- * `sudo` is normally a symlink (`/usr/bin/sudo -> /etc/alternatives/sudo`), so
- * the link target is what runs and what must be root-owned and not group- or
- * world-writable. A config `sudoPath` overrides the candidates but is checked
- * the same way; anything that fails validation leaves the plugin inactive.
- * @param configured - a config-supplied absolute path, if any.
- * @param candidates - fallback list, already absolute.
- * @returns `{ path }` for the real binary, or undefined.
- */
-function resolveTrusted(configured, candidates) {
-  const list = configured === '' ? candidates : [configured, ...candidates]
-  for (const candidate of list) {
-    try {
-      const real = realpathSync(candidate)
-      const stat = statSync(real)
-      if (!stat.isFile()) continue
-      if (stat.uid !== 0) continue
-      if ((stat.mode & 0o022) !== 0) continue
-      return { path: real, link: candidate }
-    } catch {
-      // keep looking
-    }
-  }
-  return undefined
-}
 
 /**
  * Install the Host half.
