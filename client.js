@@ -70,6 +70,9 @@ window.__ModuleLoader__.load({
       missingBinary: '缺少可信的 zenity / kdialog',
       nativeSubtitle: '这条命令需要 root。请在宿主屏幕上的系统对话框里确认命令并输入登录密码。',
       nativeWaiting: '本页不参与这次批准：请在宿主屏幕上的系统对话框里确认或拒绝。这里只是让你看到排队中的命令。',
+      checkCode: '核对码',
+      checkCodeHintNative: '系统对话框里会显示同一个核对码；对不上就别输密码。',
+      checkCodeHintBrowser: '本页模式下宿主不会弹系统对话框：有系统窗口向你要密码时，它不是本插件。',
       rememberNever: '每次输入密码',
       rememberSession: '本会话记住',
       settingsTimeout: '面板超时',
@@ -138,6 +141,9 @@ window.__ModuleLoader__.load({
       missingBinary: 'no trusted zenity / kdialog',
       nativeSubtitle: 'This command needs root. Confirm it and type the login password in the system dialog on the host screen.',
       nativeWaiting: 'This page takes no part in the approval: confirm or refuse in the system dialog on the host screen. What you see here is only the queued command.',
+      checkCode: 'Check code',
+      checkCodeHintNative: 'The system dialog shows the same check code; do not type the password if it differs.',
+      checkCodeHintBrowser: 'This mode never opens a system dialog: a system window asking for the password is not this plugin.',
       rememberNever: 'Ask every time',
       rememberSession: 'Remember for this session',
       settingsTimeout: 'Panel timeout',
@@ -190,6 +196,9 @@ window.__ModuleLoader__.load({
 .dsa-code{white-space:pre-wrap;word-break:break-word}
 .dsa-hint{font-size:12px;color:var(--dsw-alias-label-secondary)}
 .dsa-native{flex:1 1 auto;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary)}
+.dsa-code-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
+.dsa-code-chip{flex:0 0 auto;padding:1px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-family:var(--ds-font-family-code,ui-monospace,SFMono-Regular,Menlo,Consolas,monospace);font-size:14px;font-weight:600;line-height:20px;letter-spacing:.14em}
+.dsa-code-hint{flex:1 1 auto;min-width:0}
 .dsa-hint-risk{color:var(--dsw-alias-state-warn-primary)}
 .dsa-error{font-size:12px;color:var(--dsw-alias-state-error-primary)}
 .dsa-actions{display:flex;align-items:center;gap:8px;padding:12px 18px 16px}
@@ -492,6 +501,20 @@ window.__ModuleLoader__.load({
           ]),
           collapsed ? null : h('div', { className: 'dsa-body' }, [
             h('div', { key: 'sub', className: 'dsa-sub' }, nativeDialog ? t('nativeSubtitle') : t('subtitle')),
+            // The code appears on both surfaces that can answer this request, so
+            // a window that asks for the password can be checked against the page
+            // instead of against its own looks.
+            typeof snapshot.code === 'string' && snapshot.code !== ''
+              ? h('div', { key: 'code', className: 'dsa-code-row' }, [
+                  h('span', { key: 'label', className: 'dsa-code-label' }, t('checkCode')),
+                  h('code', { key: 'value', className: 'dsa-code-chip' }, snapshot.code),
+                  h(
+                    'span',
+                    { key: 'hint', className: 'dsa-code-hint' },
+                    nativeDialog ? t('checkCodeHintNative') : t('checkCodeHintBrowser'),
+                  ),
+                ])
+              : null,
             h(
               'ul',
               { key: 'list', className: 'dsa-list' },
