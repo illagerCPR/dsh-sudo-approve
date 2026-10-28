@@ -105,10 +105,28 @@ export function apply(ctx, rawConfig) {
     return { mode: 'browser', missing: dialogFacts.missing, maxLines: 60 }
   }
 
-  // Read once per boot: coverage is an allowlist plus one argument field, so a
-  // second command-running tool would be neither gated nor logged. Naming it in
-  // the boot line is the only way that gap stops being invisible.
-  const coverage = scanCoverage(ctx.get('tools'), config().toolNames)
+  /**
+   * The coverage answer, read on demand.
+   *
+   * Reading it at apply time is not enough: the tool registry is a service that
+   * comes up *after* this plugin is applied (the first build 18 boot logged
+   * `available:false` for exactly that reason), and it changes whenever plugins
+   * are enabled or disabled. A fresh read is cheap and always describes the Host
+   * as it is now.
+   *
+   * The first readable answer is written to the audit log once, so the gate's
+   * edge is recorded even if nobody opens the settings page. An unreadable
+   * registry writes nothing at all: "unknown" must never be filed as "checked".
+   */
+  let coverageAudited = false
+  const coverageOf = () => {
+    const report = scanCoverage(ctx.get('tools'), config().toolNames)
+    if (report.available && !coverageAudited) {
+      coverageAudited = true
+      audit({ event: 'coverage', covered: report.covered, uncovered: report.uncovered })
+    }
+    return report
+  }
 
   audit({
     event: 'loaded',
@@ -123,12 +141,14 @@ export function apply(ctx, rawConfig) {
     // what will collect the password rather than just "native".
     dialogBinary: dialogFacts.chooser?.path,
   })
-  audit({
-    event: 'coverage',
-    available: coverage.available,
-    covered: coverage.covered,
-    uncovered: coverage.uncovered,
-  })
+  // Ask as soon as the registry appears; the lifecycle loop retries, for the case
+  // where it was already up and `inject` has nothing to wait for.
+  ctx.effect(() => {
+    const scope = ctx.inject(['tools'], () => {
+      coverageOf()
+    })
+    return () => scope?.dispose?.()
+  }, `${NAME}: coverage`)
 
   /** sessionId → { secret, usedAt } in `remember` mode. */
   const remembered = new Map()
@@ -182,7 +202,7 @@ export function apply(ctx, rawConfig) {
     remembered,
     validatePassword: sudoAuth.validatePassword,
     surfaceOf,
-    coverageOf: () => coverage,
+    coverageOf,
   })
 
   ctx.on('tools/pre-execute', async (exec, next) => {
@@ -222,6 +242,7 @@ export function apply(ctx, rawConfig) {
     const onExit = () => shim.hardCleanup()
     process.on('exit', onExit)
     const timer = setInterval(() => {
+      if (!coverageAudited) coverageOf()
       const now = Date.now()
       gate.pruneArmed(now)
       for (const [sessionId, memo] of remembered) {
