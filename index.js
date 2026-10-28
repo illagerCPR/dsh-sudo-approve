@@ -26,9 +26,10 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-import { createAudit } from './lib/audit.js'
 import { RUN_CODE_NAME } from './lib/agents.js'
+import { createAudit } from './lib/audit.js'
 import { createSettings } from './lib/config.js'
+import { scanCoverage } from './lib/coverage.js'
 import { createGate } from './lib/gate.js'
 import { MESSAGES } from './lib/messages.js'
 import { createNativeDialog, NATIVE_MAX_LINES, sampleDialogFacts } from './lib/native-dialog.js'
@@ -43,7 +44,7 @@ import { errorText, isPlainObject } from './lib/util.js'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 17
+const BUILD = 18
 /** Fallback PATH when the Host process has none. */
 const FALLBACK_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
@@ -104,6 +105,11 @@ export function apply(ctx, rawConfig) {
     return { mode: 'browser', missing: dialogFacts.missing, maxLines: 60 }
   }
 
+  // Read once per boot: coverage is an allowlist plus one argument field, so a
+  // second command-running tool would be neither gated nor logged. Naming it in
+  // the boot line is the only way that gap stops being invisible.
+  const coverage = scanCoverage(ctx.get('tools'), config().toolNames)
+
   audit({
     event: 'loaded',
     build: BUILD,
@@ -116,6 +122,12 @@ export function apply(ctx, rawConfig) {
     // Which binary the trusted resolver picked, so the boot line says exactly
     // what will collect the password rather than just "native".
     dialogBinary: dialogFacts.chooser?.path,
+  })
+  audit({
+    event: 'coverage',
+    available: coverage.available,
+    covered: coverage.covered,
+    uncovered: coverage.uncovered,
   })
 
   /** sessionId → { secret, usedAt } in `remember` mode. */
@@ -170,6 +182,7 @@ export function apply(ctx, rawConfig) {
     remembered,
     validatePassword: sudoAuth.validatePassword,
     surfaceOf,
+    coverageOf: () => coverage,
   })
 
   ctx.on('tools/pre-execute', async (exec, next) => {

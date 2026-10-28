@@ -78,6 +78,10 @@ window.__ModuleLoader__.load({
       settingsPresenceHint: '超过该秒数没有浏览器页面轮询，就认为页面已断开并直接拒绝。',
       settingsRemote: '允许远程部署接收密码',
       settingsRemoteHint: '开启后，通过非回环地址连接的浏览器也能提交密码；明文网络路径上有风险。',
+      settingsCoverage: '审批覆盖的工具',
+      settingsCoverageHint: '审批只拦截 bash。宿主里若还有其他能执行命令的工具，它们不会被拦下，这里会把它们点名列出。',
+      coverageAll: '仅 bash（未发现其他可执行命令的工具）',
+      coverageUnknown: '—（本宿主没有提供工具清单）',
       settingsReset: '恢复超时与在线窗口',
       settingsResetDone: '已恢复超时与在线窗口；安全开关（启用、授权粒度、凭据方式）不受影响',
       settingsSaved: '已保存',
@@ -142,6 +146,10 @@ window.__ModuleLoader__.load({
       settingsPresenceHint: 'With no page poll for this many seconds, requests are rejected outright.',
       settingsRemote: 'Accept passwords from remote deployments',
       settingsRemoteHint: 'Lets a browser connected over a non-loopback address submit the password, which is risky on a plaintext path.',
+      settingsCoverage: 'Tools under approval',
+      settingsCoverageHint: 'Approval gates bash only. Any other tool in this host that can run commands is not gated, and is named here.',
+      coverageAll: 'bash only (no other command-running tool found)',
+      coverageUnknown: '— (this host exposes no tool list)',
       settingsReset: 'Restore timing defaults',
       settingsResetDone: 'Timing defaults restored; the security switches (enabled, password scope, credential) are untouched',
       settingsSaved: 'Saved',
@@ -737,6 +745,19 @@ window.__ModuleLoader__.load({
           ? ` ${t('dialogMissing')}${dialogInfo.missing.map(missingLabel).join('、')}`
           : '')
 
+      // Same guard as the dialog row: the first render has no snapshot yet, and
+      // reading through it would take the whole settings section down.
+      const coverageInfo = (snapshot && snapshot.coverage) || { available: false, uncovered: [] }
+      const uncoveredNames = Array.isArray(coverageInfo.uncovered)
+        ? coverageInfo.uncovered.map((entry) => (typeof entry === 'string' ? entry : entry?.name)).filter(Boolean)
+        : []
+      const coverageValue =
+        coverageInfo.available !== true
+          ? t('coverageUnknown')
+          : uncoveredNames.length === 0
+            ? t('coverageAll')
+            : uncoveredNames.join('、')
+
       const rememberRow = readonlyRow(
         'remember',
         t('settingsRemember'),
@@ -766,6 +787,7 @@ window.__ModuleLoader__.load({
         ),
         rememberRow,
         readonlyRow('dialog', t('settingsDialog'), dialogHint, dialogValue),
+        readonlyRow('coverage', t('settingsCoverage'), t('settingsCoverageHint'), coverageValue),
         numberRow('timeout', t('settingsTimeout'), t('settingsTimeoutHint'), 'timeoutMs', limits.timeoutMs),
         numberRow(
           'presence',
