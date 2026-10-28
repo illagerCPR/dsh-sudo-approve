@@ -113,6 +113,9 @@ export function apply(ctx, rawConfig) {
     sudo: realSudo.path,
     passwordDialog: config().passwordDialog,
     dialog: surfaceOf().mode,
+    // Which binary the trusted resolver picked, so the boot line says exactly
+    // what will collect the password rather than just "native".
+    dialogBinary: dialogFacts.chooser?.path,
   })
 
   /** sessionId → { secret, usedAt } in `remember` mode. */
