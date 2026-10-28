@@ -6,6 +6,16 @@
 
 DSH 的 bash 工具没有终端，智能体直接执行 `sudo` 只会得到一句 “A terminal is required to authenticate”。这个插件把确认环节搬到浏览器：智能体一旦要执行 sudo，聊天输入框就会被替换成授权面板，列出它准备执行的全部命令；你核对后输入登录密码并点击「允许并执行」，命令才会真正运行。
 
+## 安装
+
+```sh
+dsh plugin add dsh-sudo-approve
+```
+
+这条命令把包装进 DSH 的 profile（默认 `web`），装完重启 Host。重启后 `~/.dsh/logs/dsh-sudo-approve.log` 里会出现一行 `loaded`（带 `build` 与 `dialog` 字段），看到它才算真的加载上了。
+
+环境要求：Node ≥ 22.14，DSH ≥ 0.2.1-rc.3 且 < 0.3.0。浏览器输入方式在任何平台都能用；系统对话框方式需要本机图形会话，Linux 上还要有可信的 `zenity` 或 `kdialog`（Debian / Ubuntu：`apt install zenity`）。
+
 ## 使用流程
 
 1. 智能体发出带 sudo 的命令，输入框变成「需要 sudo 授权」面板。

@@ -1,0 +1,59 @@
+# Publish to npm from a signed tag.
+#
+# The first release of a package cannot use a trusted publisher (there is no
+# package to configure yet), so 1.0.0 was published locally. Every later version
+# is published here through OIDC: this workflow holds no npm token, and the
+# provenance statement ties the tarball to this repository and commit.
+name: publish
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # A tag that disagrees with the manifest would publish a version nobody
+      # tagged, and a version that already exists means this tag is history, not
+      # a release: the second case is a no-op, the first one fails.
+      - name: Check the tag against the manifest
+        id: check
+        run: |
+          set -eu
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json ${version}"
+            exit 1
+          fi
+          if npm view "${name}@${version}" version >/dev/null 2>&1; then
+            echo "${name}@${version} is already on the registry; nothing to publish"
+            echo "publish=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Show the tarball
+        if: steps.check.outputs.publish == 'yes'
+        run: npm pack --dry-run
+
+      - name: Publish with provenance
+        if: steps.check.outputs.publish == 'yes'
+        run: npm publish --provenance --access public

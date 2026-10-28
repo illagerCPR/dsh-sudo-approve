@@ -1,9 +1,23 @@
 {
   "name": "dsh-sudo-approve",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
   "description": "Ask before the agent runs sudo: replace the composer with the command list and a password prompt.",
+  "license": "MIT",
+  "author": "illagerCPR",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/illagerCPR/dsh-sudo-approve.git"
+  },
+  "homepage": "https://github.com/illagerCPR/dsh-sudo-approve#readme",
+  "bugs": {
+    "url": "https://github.com/illagerCPR/dsh-sudo-approve/issues"
+  },
+  "keywords": ["dsh", "deepseek-harness", "cordis", "plugin", "sudo", "approval", "security"],
+  "engines": {
+    "dsh": ">=0.2.1-rc.3 <0.3.0-0",
+    "node": ">=22.14"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
