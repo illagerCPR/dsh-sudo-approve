@@ -32,6 +32,7 @@ import { RUN_CODE_NAME } from './lib/agents.js'
 import { createSettings } from './lib/config.js'
 import { createGate } from './lib/gate.js'
 import { MESSAGES } from './lib/messages.js'
+import { createNativeDialog, NATIVE_MAX_LINES, sampleDialogFacts } from './lib/native-dialog.js'
 import { createPtc } from './lib/ptc.js'
 import { installPrompt } from './lib/prompt.js'
 import { installRoutes } from './lib/routes.js'
@@ -42,7 +43,7 @@ import { errorText, isPlainObject } from './lib/util.js'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 15
+const BUILD = 16
 /** Fallback PATH when the Host process has none. */
 const FALLBACK_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
@@ -109,6 +110,26 @@ export function apply(ctx, rawConfig) {
     return
   }
 
+  // Sampled once per boot, like the Harness directory picker: a display session
+  // that shows dialogs now will still show them a minute later, and a surface
+  // that cannot be shown must not be re-decided mid-command.
+  const dialogFacts = sampleDialogFacts(ctx)
+  /**
+   * Which surface answers this call, and how much it can show.
+   *
+   * `unavailable` is the forced-native case: a dialog was asked for that this
+   * deployment cannot show. Waiting on a surface nobody can see is refused
+   * rather than silently degraded back to the page.
+   */
+  const surfaceOf = () => {
+    const configured = config().passwordDialog
+    if (configured !== 'browser' && dialogFacts.eligible) {
+      return { mode: 'native', missing: [], maxLines: NATIVE_MAX_LINES }
+    }
+    if (configured === 'native') return { mode: 'unavailable', missing: dialogFacts.missing, maxLines: NATIVE_MAX_LINES }
+    return { mode: 'browser', missing: dialogFacts.missing, maxLines: 60 }
+  }
+
   audit({
     event: 'loaded',
     build: BUILD,
@@ -116,6 +137,8 @@ export function apply(ctx, rawConfig) {
     credential: config().credential,
     timeoutMs: config().timeoutMs,
     sudo: realSudo.path,
+    passwordDialog: config().passwordDialog,
+    dialog: surfaceOf().mode,
   })
 
   /** sessionId → { secret, usedAt } in `remember` mode. */
@@ -155,10 +178,22 @@ export function apply(ctx, rawConfig) {
 
   const ptc = createPtc({ ctx, config })
 
-  const gate = createGate({ ctx, config, audit, remembered, ptc })
+  const nativeDialog = createNativeDialog({ audit, validatePassword: sudoAuth.validatePassword })
 
-  installPrompt({ ctx, name: NAME, config, ptc })
-  installRoutes({ ctx, name: NAME, config, audit, settings, gate, remembered, validatePassword: sudoAuth.validatePassword })
+  const gate = createGate({ ctx, config, audit, remembered, ptc, surfaceOf, nativeDialog })
+
+  installPrompt({ ctx, name: NAME, config, ptc, surfaceOf })
+  installRoutes({
+    ctx,
+    name: NAME,
+    config,
+    audit,
+    settings,
+    gate,
+    remembered,
+    validatePassword: sudoAuth.validatePassword,
+    surfaceOf,
+  })
 
   ctx.on('tools/pre-execute', async (exec, next) => {
     let verdict

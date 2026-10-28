@@ -52,7 +52,24 @@ window.__ModuleLoader__.load({
       settingsEnabled: '启用拦截',
       settingsEnabledHint: '关闭后不再拦截 sudo 调用：插件仍然加载，但直接放行。',
       settingsRemember: '授权粒度',
-      settingsRememberHint: '每次输入密码更安全。“本会话记住”之后批准不再需要密码，等于关掉密码这一环；密码只存在 Host 内存，会话结束或进程退出即清除。',
+      settingsRememberHint: '每次输入密码更安全。“本会话记住”之后批准不再需要密码，等于关掉密码这一环；密码只存在 Host 内存，会话结束或进程退出即清除。系统对话框模式下这条设置不生效，每次都会弹框要密码。',
+      settingsDialog: '密码输入方式',
+      settingsDialogHint: '由配置文件决定，本页只读。auto 在有图形会话且绑定回环时用宿主系统对话框，否则退回本页。',
+      dialogAuto: '自动',
+      dialogNative: '系统对话框',
+      dialogBrowser: '本页输入',
+      dialogLabelNative: '系统对话框（宿主屏幕）',
+      dialogLabelBrowser: '本页面板',
+      dialogUnavailable: '（当前不可用）',
+      dialogMissing: '未满足条件：',
+      missingRemote: '部署接受非回环连接',
+      missingBind: '没有绑定回环地址',
+      missingSsh: '宿主由 SSH 启动',
+      missingDisplay: '没有图形会话',
+      missingPlatform: '平台不支持',
+      missingBinary: '缺少 zenity / kdialog',
+      nativeSubtitle: '这条命令需要 root。请在宿主屏幕上的系统对话框里确认命令并输入登录密码。',
+      nativeWaiting: '本页不参与这次批准：请在宿主屏幕上的系统对话框里确认或拒绝。这里只是让你看到排队中的命令。',
       rememberNever: '每次输入密码',
       rememberSession: '本会话记住',
       settingsTimeout: '面板超时',
@@ -99,7 +116,24 @@ window.__ModuleLoader__.load({
       settingsEnabled: 'Intercept sudo',
       settingsEnabledHint: 'When off, sudo calls pass through untouched while the plugin stays loaded.',
       settingsRemember: 'Password scope',
-      settingsRememberHint: 'Asking every time is safer. Remembering for the session means later approvals need no password at all; the secret lives in Host memory only and dies with the session or process.',
+      settingsRememberHint: 'Asking every time is safer. Remembering for the session means later approvals need no password at all; the secret lives in Host memory only and dies with the session or process. It has no effect when the system dialog is the approval surface.',
+      settingsDialog: 'Password surface',
+      settingsDialogHint: 'Decided by the config file; this page only reads it. "auto" uses the host system dialog when a display session is available and the bind is loopback, and falls back to this page otherwise.',
+      dialogAuto: 'Auto',
+      dialogNative: 'System dialog',
+      dialogBrowser: 'This page',
+      dialogLabelNative: 'System dialog (host screen)',
+      dialogLabelBrowser: 'This page',
+      dialogUnavailable: ' (currently unavailable)',
+      dialogMissing: 'Not available because: ',
+      missingRemote: 'the deployment accepts non-loopback connections',
+      missingBind: 'the host is not bound to loopback',
+      missingSsh: 'the host was launched over SSH',
+      missingDisplay: 'no display session',
+      missingPlatform: 'unsupported platform',
+      missingBinary: 'no zenity / kdialog on PATH',
+      nativeSubtitle: 'This command needs root. Confirm it and type the login password in the system dialog on the host screen.',
+      nativeWaiting: 'This page takes no part in the approval: confirm or refuse in the system dialog on the host screen. What you see here is only the queued command.',
       rememberNever: 'Ask every time',
       rememberSession: 'Remember for this session',
       settingsTimeout: 'Panel timeout',
@@ -147,6 +181,7 @@ window.__ModuleLoader__.load({
 .dsa-note .dsa-code{color:var(--dsw-alias-label-secondary);font-style:italic}
 .dsa-code{white-space:pre-wrap;word-break:break-word}
 .dsa-hint{font-size:12px;color:var(--dsw-alias-label-secondary)}
+.dsa-native{flex:1 1 auto;font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary)}
 .dsa-hint-risk{color:var(--dsw-alias-state-warn-primary)}
 .dsa-error{font-size:12px;color:var(--dsw-alias-state-error-primary)}
 .dsa-actions{display:flex;align-items:center;gap:8px;padding:12px 18px 16px}
@@ -276,7 +311,11 @@ window.__ModuleLoader__.load({
       const pending = props.matched
       const snapshot = (pending && pending.snapshot) || {}
       const items = Array.isArray(snapshot.items) ? snapshot.items : []
-      const passwordRequired = snapshot.passwordRequired !== false
+      // Native mode means the approval is answered on the host's own screen: the
+      // page has no password field and no buttons, because pressing one must not
+      // be able to stand in for the person at the display.
+      const nativeDialog = snapshot.dialog === 'native'
+      const passwordRequired = snapshot.passwordRequired !== false && !nativeDialog
       const [password, setPassword] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState('')
@@ -419,7 +458,7 @@ window.__ModuleLoader__.load({
               event.preventDefault()
               if (collapsed) setCollapsed(false)
               else if (rejecting) closeReject()
-              else setRejecting(true)
+              else if (!nativeDialog) setRejecting(true)
             },
           },
           h('div', { className: 'dsa-strip' }, [
@@ -444,7 +483,7 @@ window.__ModuleLoader__.load({
             ),
           ]),
           collapsed ? null : h('div', { className: 'dsa-body' }, [
-            h('div', { key: 'sub', className: 'dsa-sub' }, t('subtitle')),
+            h('div', { key: 'sub', className: 'dsa-sub' }, nativeDialog ? t('nativeSubtitle') : t('subtitle')),
             h(
               'ul',
               { key: 'list', className: 'dsa-list' },
@@ -460,11 +499,15 @@ window.__ModuleLoader__.load({
                 ),
               ),
             ),
-            passwordRequired || rejecting ? null : h('div', { key: 'hint', className: 'dsa-hint dsa-hint-risk' }, t('remembered')),
+            passwordRequired || rejecting || nativeDialog
+              ? null
+              : h('div', { key: 'hint', className: 'dsa-hint dsa-hint-risk' }, t('remembered')),
             error === '' ? null : h('div', { key: 'error', className: 'dsa-error', role: 'alert' }, error),
           ]),
           collapsed
             ? null
+            : nativeDialog
+            ? h('div', { className: 'dsa-actions' }, [h('div', { key: 'native', className: 'dsa-native' }, t('nativeWaiting'))])
             : rejecting
             ? h('div', { className: 'dsa-actions' }, [
                 h('input', {
@@ -667,6 +710,31 @@ window.__ModuleLoader__.load({
           ]),
         )
 
+      const missingLabel = (code) =>
+        ({
+          'remote-authority': t('missingRemote'),
+          'bind-address': t('missingBind'),
+          ssh: t('missingSsh'),
+          display: t('missingDisplay'),
+          platform: t('missingPlatform'),
+          'dialog-binary': t('missingBinary'),
+        })[code] ?? code
+
+      const dialogInfo = snapshot.dialog || { mode: 'browser', missing: [] }
+      const dialogConfigured =
+        values.passwordDialog === 'native'
+          ? t('dialogNative')
+          : values.passwordDialog === 'browser'
+            ? t('dialogBrowser')
+            : `${t('dialogAuto')} → ${dialogInfo.mode === 'native' ? t('dialogLabelNative') : t('dialogLabelBrowser')}`
+      const dialogValue =
+        dialogInfo.mode === 'unavailable' ? `${dialogConfigured}${t('dialogUnavailable')}` : dialogConfigured
+      const dialogHint =
+        t('settingsDialogHint') +
+        (Array.isArray(dialogInfo.missing) && dialogInfo.missing.length > 0
+          ? ` ${t('dialogMissing')}${dialogInfo.missing.map(missingLabel).join('、')}`
+          : '')
+
       const rememberRow = readonlyRow(
         'remember',
         t('settingsRemember'),
@@ -695,6 +763,7 @@ window.__ModuleLoader__.load({
           values.enabled === false ? '—' : '✓',
         ),
         rememberRow,
+        readonlyRow('dialog', t('settingsDialog'), dialogHint, dialogValue),
         numberRow('timeout', t('settingsTimeout'), t('settingsTimeoutHint'), 'timeoutMs', limits.timeoutMs),
         numberRow(
           'presence',
