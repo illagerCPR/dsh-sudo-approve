@@ -120,14 +120,28 @@ export function apply(ctx, rawConfig) {
    */
   const stages = { none: 0, partial: 1, final: 2 }
   let coverageStage = 'none'
+  /**
+   * The views worth reading: the global registry plus every live session's own.
+   *
+   * A tool can be mounted inside an agent composition rather than globally, and
+   * `bash` is exactly that on this Host: the global view alone never shows it,
+   * which is why the first attempts could not settle. The runtime reads
+   * `schemas(agent)` for the same reason when it lists an agent's tools.
+   */
+  const coverageScopes = () => {
+    const agents = ctx.get('agents')
+    const list = typeof agents?.list === 'function' ? agents.list() : []
+    return [undefined, ...list.filter((agent) => agent !== undefined)]
+  }
   const coverageOf = () => {
-    const report = scanCoverage(ctx.get('tools'), config().toolNames)
+    const report = scanCoverage(ctx.get('tools'), config().toolNames, coverageScopes())
     const stage = report.available ? 'final' : report.total > 0 ? 'partial' : 'none'
     if (stages[stage] > stages[coverageStage]) {
       coverageStage = stage
       audit({
         event: 'coverage',
         final: stage === 'final',
+        views: report.views,
         tools: report.total,
         covered: report.covered,
         uncovered: report.uncovered,
