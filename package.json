@@ -13,7 +13,15 @@
   "bugs": {
     "url": "https://github.com/illagerCPR/dsh-sudo-approve/issues"
   },
-  "keywords": ["dsh", "deepseek-harness", "cordis", "plugin", "sudo", "approval", "security"],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "sudo",
+    "approval",
+    "security"
+  ],
   "engines": {
     "dsh": ">=0.2.1-rc.3 <0.3.0-0",
     "node": ">=22.14"
@@ -24,7 +32,15 @@
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
-  "files": ["index.js", "lib", "client.js", "cordis.patch.yml", "SECURITY.md", "locale/*.json", "icon.svg"],
+  "files": [
+    "index.js",
+    "lib",
+    "client.js",
+    "cordis.patch.yml",
+    "SECURITY.md",
+    "locale/*.json",
+    "icon.svg"
+  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -32,7 +48,12 @@
     "client": {
       "platform": "web",
       "immediately": true,
-      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
+  },
+  "scripts": {
+    "test": "node test/native.mjs && node test/client.mjs && node test/audit.mjs && node test/split.mjs && node test/coverage.mjs"
   }
 }
