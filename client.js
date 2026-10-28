@@ -516,7 +516,9 @@ window.__ModuleLoader__.load({
                   type: 'password',
                   value: password,
                   placeholder: t('password'),
-                  autoComplete: 'current-password',
+                  // Never let a password manager read this as a login form: the
+                  // secret is the OS account password, not a site credential.
+                  autoComplete: 'off',
                   spellCheck: false,
                   disabled: busy,
                   onChange: (event) => setPassword(event.target.value),

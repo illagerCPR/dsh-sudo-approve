@@ -28,7 +28,7 @@ import { dirname, join } from 'node:path'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 13
+const BUILD = 14
 /** Exact Fetch routes the browser half calls. */
 const ROUTE_PREFIX = '/api/sudo-approve'
 /** Fallback PATH when the Host process has none. */
@@ -39,6 +39,16 @@ const LIMITS = {
   presenceWindowMs: [2_000, 300_000],
   memoryTtlMs: [60_000, 24 * 60 * 60 * 1000],
 }
+
+/**
+ * The presence window the page may set.
+ *
+ * `presenceWindowMs` is how long a stale "I am on screen" claim is trusted, so
+ * the page may narrow it but must not widen it: a script that could set five
+ * minutes would keep the gate convinced somebody is watching long after the tab
+ * was closed. The file keeps the wider `LIMITS` range for slow, headless setups.
+ */
+const PAGE_LIMITS = { presenceWindowMs: [2_000, 30_000] }
 
 /**
  * Candidates for the real sudo. Resolution is confined to root-owned locations
@@ -200,7 +210,10 @@ function sanitizeRuntimePatch(raw) {
   if (!isPlainObject(raw)) return patch
   if (typeof raw.timeoutMs === 'number' && Number.isFinite(raw.timeoutMs)) patch.timeoutMs = Math.round(raw.timeoutMs)
   if (typeof raw.presenceWindowMs === 'number' && Number.isFinite(raw.presenceWindowMs)) {
-    patch.presenceWindowMs = Math.round(raw.presenceWindowMs)
+    // Clamped here and not only in `resolveConfig`, because the stored value is
+    // what the next request reads: a page must not be able to bank a wide one.
+    const [low, high] = PAGE_LIMITS.presenceWindowMs
+    patch.presenceWindowMs = Math.min(Math.max(Math.round(raw.presenceWindowMs), low), high)
   }
   return patch
 }
@@ -467,7 +480,7 @@ export function apply(ctx, rawConfig) {
       build: BUILD,
       store: storePath,
       auditLog,
-      limits: { timeoutMs: LIMITS.timeoutMs, presenceWindowMs: LIMITS.presenceWindowMs },
+      limits: { timeoutMs: LIMITS.timeoutMs, presenceWindowMs: PAGE_LIMITS.presenceWindowMs },
       /** Keys the page shows but cannot change; edit the config or the store. */
       readOnly: ['enabled', 'remember', 'credential', 'allowRemoteDeployment', 'sudoPath'],
       values: {
@@ -1268,7 +1281,14 @@ export function apply(ctx, rawConfig) {
     if (entry === undefined) return next()
     armed.delete(key)
     const command = isPlainObject(exec.arguments) && typeof exec.arguments.command === 'string' ? exec.arguments.command : undefined
-    if (entry.digest !== undefined && command !== undefined && digestOf(command) !== entry.digest) {
+    // The secret may only be released to the exact command the user saw. When the
+    // command cannot even be read back, that cannot be shown, so it is refused
+    // rather than dispatched on the strength of the call id alone.
+    if (command === undefined) {
+      audit({ event: 'armed-mismatch', callId: exec.callId, sessionId: entry.sessionId, reason: 'no-command' })
+      throw new Error(MESSAGES.mismatch)
+    }
+    if (digestOf(command) !== entry.digest) {
       audit({ event: 'armed-mismatch', callId: exec.callId, sessionId: entry.sessionId })
       throw new Error(MESSAGES.mismatch)
     }
