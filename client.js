@@ -720,7 +720,9 @@ window.__ModuleLoader__.load({
           'dialog-binary': t('missingBinary'),
         })[code] ?? code
 
-      const dialogInfo = snapshot.dialog || { mode: 'browser', missing: [] }
+      // First render has no snapshot yet; guarding here is what keeps the whole
+      // settings section from throwing before the config request comes back.
+      const dialogInfo = (snapshot && snapshot.dialog) || { mode: 'browser', missing: [] }
       const dialogConfigured =
         values.passwordDialog === 'native'
           ? t('dialogNative')
