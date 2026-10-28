@@ -80,8 +80,8 @@ window.__ModuleLoader__.load({
       settingsRemoteHint: '开启后，通过非回环地址连接的浏览器也能提交密码；明文网络路径上有风险。',
       settingsCoverage: '审批覆盖的工具',
       settingsCoverageHint: '审批只拦截 bash。宿主里若还有其他能执行命令的工具，它们不会被拦下，这里会把它们点名列出。',
-      coverageAll: '仅 bash（未发现其他可执行命令的工具）',
-      coverageUnknown: '—（本宿主没有提供工具清单）',
+      coverageAll: '仅 bash（清单共 {n} 个工具，未发现其他能执行命令的）',
+      coverageUnknown: '—（工具清单还没就绪）',
       settingsReset: '恢复超时与在线窗口',
       settingsResetDone: '已恢复超时与在线窗口；安全开关（启用、授权粒度、凭据方式）不受影响',
       settingsSaved: '已保存',
@@ -148,8 +148,8 @@ window.__ModuleLoader__.load({
       settingsRemoteHint: 'Lets a browser connected over a non-loopback address submit the password, which is risky on a plaintext path.',
       settingsCoverage: 'Tools under approval',
       settingsCoverageHint: 'Approval gates bash only. Any other tool in this host that can run commands is not gated, and is named here.',
-      coverageAll: 'bash only (no other command-running tool found)',
-      coverageUnknown: '— (this host exposes no tool list)',
+      coverageAll: 'bash only (of the {n} tools in the list, none other runs commands)',
+      coverageUnknown: '— (the tool list is not ready yet)',
       settingsReset: 'Restore timing defaults',
       settingsResetDone: 'Timing defaults restored; the security switches (enabled, password scope, credential) are untouched',
       settingsSaved: 'Saved',
@@ -755,7 +755,7 @@ window.__ModuleLoader__.load({
         coverageInfo.available !== true
           ? t('coverageUnknown')
           : uncoveredNames.length === 0
-            ? t('coverageAll')
+            ? t('coverageAll').replace('{n}', String(coverageInfo.total ?? 0))
             : uncoveredNames.join('、')
 
       const rememberRow = readonlyRow(

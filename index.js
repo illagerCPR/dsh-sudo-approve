@@ -108,22 +108,30 @@ export function apply(ctx, rawConfig) {
   /**
    * The coverage answer, read on demand.
    *
-   * Reading it at apply time is not enough: the tool registry is a service that
-   * comes up *after* this plugin is applied (the first build 18 boot logged
-   * `available:false` for exactly that reason), and it changes whenever plugins
-   * are enabled or disabled. A fresh read is cheap and always describes the Host
-   * as it is now.
+   * Reading it at apply time is not enough: the tool registry service comes up
+   * after this plugin is applied, and its contents fill in after that (the first
+   * two boots of this build logged `available:false`, then an empty list). A
+   * read is therefore only treated as an answer once the tools this gate claims
+   * to cover are visible in it; anything earlier is a partial view worth one
+   * audit line, not a verdict.
    *
-   * The first readable answer is written to the audit log once, so the gate's
-   * edge is recorded even if nobody opens the settings page. An unreadable
-   * registry writes nothing at all: "unknown" must never be filed as "checked".
+   * Both stages are logged at most once, so the record shows how the view filled
+   * in without burying it in retries: "unknown" must never be filed as "checked".
    */
-  let coverageAudited = false
+  const stages = { none: 0, partial: 1, final: 2 }
+  let coverageStage = 'none'
   const coverageOf = () => {
     const report = scanCoverage(ctx.get('tools'), config().toolNames)
-    if (report.available && !coverageAudited) {
-      coverageAudited = true
-      audit({ event: 'coverage', covered: report.covered, uncovered: report.uncovered })
+    const stage = report.available ? 'final' : report.total > 0 ? 'partial' : 'none'
+    if (stages[stage] > stages[coverageStage]) {
+      coverageStage = stage
+      audit({
+        event: 'coverage',
+        final: stage === 'final',
+        tools: report.total,
+        covered: report.covered,
+        uncovered: report.uncovered,
+      })
     }
     return report
   }
@@ -141,16 +149,17 @@ export function apply(ctx, rawConfig) {
     // what will collect the password rather than just "native".
     dialogBinary: dialogFacts.chooser?.path,
   })
-  // The registry service comes up before its tools do: the first boot of this
-  // build read it 38 ms after apply and got an empty list. So ask again soon
-  // after, and keep asking on the lifecycle loop until an answer is real.
+
+  // The registry service comes up before its tools do, so the first read is
+  // usually too early. Ask again soon after, and keep asking on the lifecycle
+  // loop, until a read can see the tools this gate covers.
   ctx.effect(() => {
     const scope = ctx.inject(['tools'], () => {
       coverageOf()
     })
     const timers = [2_000, 8_000].map((delay) =>
       setTimeout(() => {
-        if (!coverageAudited) coverageOf()
+        if (coverageStage !== 'final') coverageOf()
       }, delay),
     )
     return () => {
@@ -251,7 +260,7 @@ export function apply(ctx, rawConfig) {
     const onExit = () => shim.hardCleanup()
     process.on('exit', onExit)
     const timer = setInterval(() => {
-      if (!coverageAudited) coverageOf()
+      if (coverageStage !== 'final') coverageOf()
       const now = Date.now()
       gate.pruneArmed(now)
       for (const [sessionId, memo] of remembered) {
