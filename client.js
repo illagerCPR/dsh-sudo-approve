@@ -34,7 +34,7 @@ window.__ModuleLoader__.load({
       confirmReject: '确认拒绝',
       cancel: '取消',
       working: '处理中…',
-      remembered: '已记住本次会话的密码，可直接允许',
+      remembered: '已记住本次会话的密码：这次不用再输入，点「允许并执行」即以它放行。记住期间，任何能在本页面执行脚本的东西都可以在你不动手的情况下批准。',
       invalidPassword: '密码不正确，请重试。',
       passwordRequired: '请输入密码。',
       stale: '该请求已失效。',
@@ -52,7 +52,7 @@ window.__ModuleLoader__.load({
       settingsEnabled: '启用拦截',
       settingsEnabledHint: '关闭后不再拦截 sudo 调用：插件仍然加载，但直接放行。',
       settingsRemember: '授权粒度',
-      settingsRememberHint: '每次输入密码更安全；“本会话记住”的密码只存在 Host 内存，会话结束或进程退出即清除。',
+      settingsRememberHint: '每次输入密码更安全。“本会话记住”之后批准不再需要密码，等于关掉密码这一环；密码只存在 Host 内存，会话结束或进程退出即清除。',
       rememberNever: '每次输入密码',
       rememberSession: '本会话记住',
       settingsTimeout: '面板超时',
@@ -61,8 +61,8 @@ window.__ModuleLoader__.load({
       settingsPresenceHint: '超过该秒数没有浏览器页面轮询，就认为页面已断开并直接拒绝。',
       settingsRemote: '允许远程部署接收密码',
       settingsRemoteHint: '开启后，通过非回环地址连接的浏览器也能提交密码；明文网络路径上有风险。',
-      settingsReset: '恢复默认',
-      settingsResetDone: '已恢复为安装时的默认设置',
+      settingsReset: '恢复超时与在线窗口',
+      settingsResetDone: '已恢复超时与在线窗口；安全开关（启用、授权粒度、凭据方式）不受影响',
       settingsSaved: '已保存',
       settingsSaving: '保存中…',
       settingsSaveFailed: '保存失败，请重试。',
@@ -81,7 +81,7 @@ window.__ModuleLoader__.load({
       confirmReject: 'Confirm reject',
       cancel: 'Cancel',
       working: 'Working…',
-      remembered: 'This session already remembers the password',
+      remembered: 'This session holds the password already, so this approval reuses it. While it is remembered, anything that can run script in this page can approve without you.',
       invalidPassword: 'Wrong password. Try again.',
       passwordRequired: 'Enter the password.',
       stale: 'This request is no longer pending.',
@@ -99,7 +99,7 @@ window.__ModuleLoader__.load({
       settingsEnabled: 'Intercept sudo',
       settingsEnabledHint: 'When off, sudo calls pass through untouched while the plugin stays loaded.',
       settingsRemember: 'Password scope',
-      settingsRememberHint: 'Asking every time is safer. A remembered password lives in Host memory only and dies with the session or process.',
+      settingsRememberHint: 'Asking every time is safer. Remembering for the session means later approvals need no password at all; the secret lives in Host memory only and dies with the session or process.',
       rememberNever: 'Ask every time',
       rememberSession: 'Remember for this session',
       settingsTimeout: 'Panel timeout',
@@ -108,8 +108,8 @@ window.__ModuleLoader__.load({
       settingsPresenceHint: 'With no page poll for this many seconds, requests are rejected outright.',
       settingsRemote: 'Accept passwords from remote deployments',
       settingsRemoteHint: 'Lets a browser connected over a non-loopback address submit the password, which is risky on a plaintext path.',
-      settingsReset: 'Restore defaults',
-      settingsResetDone: 'Restored the install-time defaults',
+      settingsReset: 'Restore timing defaults',
+      settingsResetDone: 'Timing defaults restored; the security switches (enabled, password scope, credential) are untouched',
       settingsSaved: 'Saved',
       settingsSaving: 'Saving…',
       settingsSaveFailed: 'Could not save. Try again.',
@@ -147,6 +147,7 @@ window.__ModuleLoader__.load({
 .dsa-note .dsa-code{color:var(--dsw-alias-label-secondary);font-style:italic}
 .dsa-code{white-space:pre-wrap;word-break:break-word}
 .dsa-hint{font-size:12px;color:var(--dsw-alias-label-secondary)}
+.dsa-hint-risk{color:var(--dsw-alias-state-warn-primary)}
 .dsa-error{font-size:12px;color:var(--dsw-alias-state-error-primary)}
 .dsa-actions{display:flex;align-items:center;gap:8px;padding:12px 18px 16px}
 .dsa-spacer{flex:1 1 auto}
@@ -327,16 +328,38 @@ window.__ModuleLoader__.load({
         setError('')
       }
 
+      /**
+       * Report a gesture before approving.
+       *
+       * The Host snapshots "did a gesture happen lately" before it records the
+       * request that asks, so an approval carrying its own claim would be judged
+       * against a fact it had just written. Sending the report first keeps the
+       * order honest; the claim itself is still this page's word, which is why
+       * the security switches stay file-only (see SECURITY.md).
+       */
+      const reportGesture = async () => {
+        try {
+          await fetch(`${PENDING_ENDPOINT}?state=visible&interaction=1`, {
+            credentials: 'same-origin',
+            headers: { accept: 'application/json' },
+          })
+        } catch {
+          // A report that fails to send is not fatal: the Host may refuse, and
+          // the error message tells the user to click again.
+        }
+      }
+
       const submit = async (decision) => {
         if (busy) return
         setBusy(true)
         setError('')
         try {
           const body = { id: pending.key, decision }
-          // An approval has to carry the click that produced it; the Host also
-          // refuses an approval from a page that stopped reporting itself visible.
+          // An approval has to follow a gesture the page reported first; the
+          // Host no longer lets the approval request supply its own evidence.
           const flags = decision === 'approve' ? '?state=visible&interaction=1' : ''
           if (decision === 'approve') {
+            await reportGesture()
             body.interaction = true
             if (password !== '') body.password = password
           } else {
@@ -437,7 +460,7 @@ window.__ModuleLoader__.load({
                 ),
               ),
             ),
-            passwordRequired || rejecting ? null : h('div', { key: 'hint', className: 'dsa-hint' }, t('remembered')),
+            passwordRequired || rejecting ? null : h('div', { key: 'hint', className: 'dsa-hint dsa-hint-risk' }, t('remembered')),
             error === '' ? null : h('div', { key: 'error', className: 'dsa-error', role: 'alert' }, error),
           ]),
           collapsed

@@ -28,7 +28,7 @@ import { dirname, join } from 'node:path'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 12
+const BUILD = 13
 /** Exact Fetch routes the browser half calls. */
 const ROUTE_PREFIX = '/api/sudo-approve'
 /** Fallback PATH when the Host process has none. */
@@ -130,7 +130,7 @@ const MESSAGES = Object.freeze({
   internal: (detail) => `sudo 审批插件内部错误，已拒绝执行：${detail}`,
   /** The panel may not show everything, so it refuses instead of hiding a tail. */
   truncated: (lines, width) =>
-    `sudo 审批：该命令超出面板可完整显示的长度（最多 ${lines} 行、单行 ${width} 字符），为避免你批准看不见的内容，已拒绝执行。请把命令拆成更短的几条、或把长内容写进脚本文件后只调用脚本。`,
+    `sudo 审批：该命令超出面板可完整显示的长度（最多 ${lines} 行、单行 ${width} 字符），为避免你批准看不见的内容，已拒绝执行。请把命令拆成更短的几条分别执行；不要把需要授权的内容藏进脚本文件再调用——那样面板同样看不到它。`,
   /** The approval record does not describe the call that is about to run. */
   mismatch: 'sudo 审批：批准记录与本次调用不匹配（会话、调用或命令内容已变化），已拒绝执行。请重新发起一次 sudo 调用。',
   /** `credential: timestamp` was configured but the cache cannot be reused here. */
@@ -158,6 +158,14 @@ function normalizeReason(value) {
   if (text === '') return undefined
   return text.length > 200 ? `${text.slice(0, 200)}…` : text
 }
+
+/**
+ * The only settings the page may change. They decide timing, not authority, so
+ * a script holding a session cookie can move them without gaining anything but
+ * a wider window; everything that decides what the gate does stays file-only.
+ * `sanitizeRuntimePatch` below and the reset both have to agree with this list.
+ */
+const PAGE_EDITABLE_KEYS = Object.freeze(['timeoutMs', 'presenceWindowMs'])
 
 /**
  * Keep only well-typed values from the settings file. Security-relevant keys
@@ -241,19 +249,38 @@ const MAX_DISPLAY_LINES = 60
 const MAX_DISPLAY_WIDTH = 400
 
 /**
+ * Remove shell line continuations.
+ *
+ * A backslash before a newline is deleted before the line is split into words,
+ * so `su\` + newline + `do` runs `sudo` while the raw text never contains the
+ * word. Folding first is what makes the scan and the panel describe the command
+ * bash will actually parse. Folding is deliberately over-eager: a backslash
+ * inside single quotes stays literal for the shell, and folding it anyway can
+ * only add a panel, never remove one.
+ * @param text - the raw command string.
+ * @returns the same command with continuations folded away.
+ */
+function foldContinuations(text) {
+  return text.replace(/\\\r?\n/g, '')
+}
+
+/**
  * Turn a bash command into the lines the panel lists.
  *
  * `truncated` is a security fact, not a display detail: an approval covers the
  * whole command string, so a command the panel cannot show in full must never
  * be approved — the caller refuses it instead.
  * @param command - the tool's `command` argument.
- * @returns the displayed items, whether any of them needs real authority, and
- *   whether the panel would be hiding part of the command.
+ * @returns the displayed items, whether any of them needs real authority,
+ *   whether the word appears at all, and whether the panel would hide part of
+ *   the command.
  */
 function analyzeCommand(command) {
+  // Folding before splitting means the panel lists the text bash will parse.
+  const folded = foldContinuations(command)
   const items = []
   let truncated = false
-  for (const raw of command.split(/\r?\n/)) {
+  for (const raw of folded.split(/\r?\n/)) {
     const text = raw.trim()
     if (text === '') continue
     if (items.length >= MAX_DISPLAY_LINES) {
@@ -274,6 +301,9 @@ function analyzeCommand(command) {
   return {
     items,
     hasSudo: items.some((item) => item.privileged),
+    // Whether the word appears at all is a separate question from whether it
+    // needs authority: it may sit in a comment, or in a `-k` form.
+    mentionsSudo: SUDO_TOKEN.test(folded),
     truncated,
     digest: digestOf(command),
   }
@@ -409,14 +439,26 @@ export function apply(ctx, rawConfig) {
     applyOverrides(next)
   }
 
-  /** Drop every saved value, back to the install-time config. */
+  /**
+   * Drop the saved values the page is allowed to change; keep the rest.
+   *
+   * A reset that deleted the whole store used to hand the page a way around the
+   * file-only rule: it could not POST `enabled:false`, but it could delete a
+   * file that said `enabled:false` and fall back to the install-time value. The
+   * two timing knobs belong to the page, so only they go.
+   * @returns the keys that survived, so the audit line can name them.
+   */
   function resetOverrides() {
+    const next = { ...overrides }
+    for (const key of PAGE_EDITABLE_KEYS) delete next[key]
     try {
-      rmSync(storePath, { force: true })
+      if (Object.keys(next).length === 0) rmSync(storePath, { force: true })
+      else writeFileSync(storePath, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
     } catch {
-      // best effort
+      // best effort: the in-memory reset still applies
     }
-    applyOverrides({})
+    applyOverrides(next)
+    return Object.keys(next)
   }
 
   /** Values and bounds the settings page renders. */
@@ -1030,7 +1072,15 @@ export function apply(ctx, rawConfig) {
         // to what the user was shown.
         digest: digestOf(typeof exec.arguments.command === 'string' ? exec.arguments.command : ''),
       })
-      audit({ event: 'approved', id: request.id, sessionId: request.sessionId, callId: request.callId, digest: analysis.digest })
+      audit({
+        event: 'approved',
+        id: request.id,
+        sessionId: request.sessionId,
+        callId: request.callId,
+        digest: analysis.digest,
+        // A remembered secret was reused: no password was typed for this one.
+        ...(decision.memo === true ? { memo: true } : {}),
+      })
       return undefined
     }
     if (decision.kind === 'rejected') {
@@ -1060,11 +1110,10 @@ export function apply(ctx, rawConfig) {
     const args = exec.arguments
     if (!isPlainObject(args) || typeof args.command !== 'string' || args.command === '') return undefined
     const analysis = analyzeCommand(args.command)
-    // A sudo call can sit past the display cap, where neither the panel nor the
-    // per-line scan can see it, so the whole string is scanned before this
-    // command is written off as needing no gate at all.
-    const mentionsSudo = SUDO_TOKEN.test(args.command)
-    if (!analysis.hasSudo && !mentionsSudo) return undefined
+    // A sudo call can sit past the display cap, where the per-line scan cannot
+    // see it, so the folded whole string is scanned before this command is
+    // written off as needing no gate at all.
+    if (!analysis.hasSudo && !analysis.mentionsSudo) return undefined
     // An approval covers the whole command string, so a command the panel could
     // not show in full is refused rather than approved blind.
     if (analysis.truncated) {
@@ -1093,7 +1142,7 @@ export function apply(ctx, rawConfig) {
   // opening sentence (how to get to sudo at all) depends on the presentation.
   const SUDO_RULES = [
     'Write it plainly (`sudo <command>`) — the approved call authenticates by itself, so never pass a password, pipe one in, or add `-n`/`-S`/askpass flags; `sudo -n` always fails here.',
-    'Keep the whole command short: the panel shows at most 60 lines and 400 characters per line, and a command that would not fit is refused outright instead of being approved blind — split it up, or put the long part in a script file and call that.',
+    'Keep the whole command short: the panel shows at most 60 lines and 400 characters per line, and a command that would not fit is refused outright instead of being approved blind — split it into several shorter commands. Do not move part of it into a script file and call that instead: a file the panel cannot show is a file the user never approved.',
     'One approval covers the whole command string, so keep sudo lines few and short. A rejection may quote the user\u2019s reason: do not retry the same command unchanged.',
     'Approvals are handled one at a time in arrival order: a parallel sudo call waits in line instead of failing, but each wait delays the command behind it, so keep sudo calls sequential and few. `sudo -k`, `-K`, `-V` and `-h` alone need no approval; sudo is unavailable in subagents and background jobs.',
   ].join(' ')
@@ -1160,6 +1209,10 @@ export function apply(ctx, rawConfig) {
    * command needs no help at all: it runs untouched and the cache is dropped
    * afterwards. Otherwise a shim is built for this dispatch and injected through
    * the spec of its spawn only, so no other process can inherit the password.
+   *
+   * Both paths drop the timestamp cache when they are done. That record is not a
+   * detail of the delivery method: it is what lets a later `sudo` skip the
+   * password entirely, so an approval must never leave one behind.
    * @param exec - the tool call being dispatched.
    * @param secret - the validated password.
    * @param next - the rest of the middleware chain.
@@ -1190,6 +1243,11 @@ export function apply(ctx, rawConfig) {
       return await approvalScope.run(run, () => next())
     } finally {
       await dematerialize(run)
+      // The approved command's own `sudo -A` authenticates, and a successful
+      // authentication writes a timestamp record. Drop it on this path too: the
+      // record is what would turn one approval into a password-free window for
+      // anything that can reuse its key, whatever `credential` was configured.
+      await clearTimestamp()
       audit({ event: 'finished', callId: exec.callId })
     }
   }
@@ -1238,9 +1296,9 @@ export function apply(ctx, rawConfig) {
    *
    * `state=visible` and `interaction=1` are claims made by the page, so they are
    * a speed bump rather than a proof: they stop a hidden tab from counting as
-   * somebody watching, and they make an approval carry the click that produced
-   * it. A script that holds a session cookie can still assert both; that is why
-   * the security-relevant switches are file-only.
+   * somebody watching, and they let a gesture be reported before the approval
+   * that leans on it. A script that holds a session cookie can assert both; that
+   * is why the security-relevant switches are file-only.
    */
   function notePresence(request) {
     const now = Date.now()
@@ -1255,8 +1313,15 @@ export function apply(ctx, rawConfig) {
     if (url.searchParams.get('interaction') === '1') lastInteractionAt = now
   }
 
-  /** Answer the page's approve/reject click. */
-  async function respond(body) {
+  /**
+   * Answer the page's approve/reject click.
+   * @param body - the JSON body.
+   * @param gestured - whether a gesture was reported *before* this request was
+   *   seen. It is read by the route before `notePresence` records the current
+   *   request, because an approval that supplied its own evidence would be
+   *   judged against a fact it had just written.
+   */
+  async function respond(body, gestured) {
     const id = typeof body?.id === 'string' ? body.id : undefined
     const decision = body?.decision === 'approve' || body?.decision === 'reject' ? body.decision : undefined
     if (id === undefined || decision === undefined) {
@@ -1273,20 +1338,24 @@ export function apply(ctx, rawConfig) {
       request.settle?.({ kind: 'rejected', reason: normalizeReason(body?.reason) })
       return respondJson({ ok: true, value: { state: 'rejected' } })
     }
-    // An approval has to carry the click that produced it.
-    if (body?.interaction !== true || !interactionPresent()) {
+    // An approval leans on a gesture reported before it, never on its own claim.
+    if (body?.interaction !== true || gestured !== true) {
       audit({ event: 'denied', reason: 'no-interaction', id: request.id, sessionId: request.sessionId })
       return respondJson(
-        { ok: false, error: { code: 'sudo-approve/no-interaction', message: 'approval requires a fresh user interaction on this page' } },
+        { ok: false, error: { code: 'sudo-approve/no-interaction', message: 'approval requires a user gesture reported before it' } },
         403,
       )
     }
     request.resolving = true
     try {
       let secret = typeof body?.password === 'string' && body.password !== '' ? body.password : undefined
+      let memo = false
       if (secret === undefined && config.remember === 'session') {
-        const memo = remembered.get(request.sessionId)
-        if (memo !== undefined) secret = memo.secret
+        const stored = remembered.get(request.sessionId)
+        if (stored !== undefined) {
+          secret = stored.secret
+          memo = true
+        }
       }
       if (secret === undefined) {
         return respondJson({ ok: false, error: { code: 'sudo-approve/password-required', message: 'password is required' } }, 400)
@@ -1296,7 +1365,7 @@ export function apply(ctx, rawConfig) {
         return respondJson({ ok: false, error: { code: 'sudo-approve/invalid-password', message: MESSAGES.invalidPassword } }, 403)
       }
       if (config.remember === 'session') remembered.set(request.sessionId, { secret, usedAt: Date.now() })
-      request.settle?.({ kind: 'approved', secret })
+      request.settle?.({ kind: 'approved', secret, memo })
       return respondJson({ ok: true, value: { state: 'approved' } })
     } finally {
       request.resolving = false
@@ -1321,6 +1390,9 @@ export function apply(ctx, rawConfig) {
         methods: ['POST'],
         requestBody: 'buffered',
         fetch: async (request) => {
+          // Read the gesture *before* this request records its own claim: an
+          // approval must rest on evidence that existed when it arrived.
+          const gestured = interactionPresent()
           notePresence(request)
           let body
           try {
@@ -1328,7 +1400,7 @@ export function apply(ctx, rawConfig) {
           } catch {
             return respondJson({ ok: false, error: { code: 'sudo-approve/bad-request', message: 'body is not JSON' } }, 400)
           }
-          return respond(body)
+          return respond(body, gestured)
         },
       })
       connection.fetch.register({
@@ -1346,8 +1418,8 @@ export function apply(ctx, rawConfig) {
             return respondJson({ ok: false, error: { code: 'sudo-approve/bad-request', message: 'body is not JSON' } }, 400)
           }
           if (body?.reset === true) {
-            resetOverrides()
-            audit({ event: 'configured', reset: true })
+            const kept = resetOverrides()
+            audit({ event: 'configured', reset: true, ...(kept.length === 0 ? {} : { kept }) })
             return respondJson({ ok: true, value: settingsSnapshot() })
           }
           // Only the two timing knobs are page-editable; everything that
