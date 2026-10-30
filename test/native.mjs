@@ -136,7 +136,8 @@ function makeCtx(options = {}) {
 }
 
 const mod = await import(`${root}/index.js`)
-const { sampleDialogFacts } = await import(`${root}/lib/native-dialog.js`)
+const { DIALOG_WRAP_COLUMNS, NATIVE_MAX_ROWS, foldLine, nativeRowCount, sampleDialogFacts } =
+  await import(`${root}/lib/native-dialog.js`)
 
 const agent = { id: 'session-x', session: { cwd: '/tmp' } }
 const callExec = (command, extra = {}) => ({ name: 'bash', callId: `c${Math.random().toString(16).slice(2)}`, agent, arguments: { command }, ...extra })
@@ -319,6 +320,59 @@ if (hasZenity) {
   check('P1-3 a kdialog command is escaped instead', kdArgs.includes('&lt;b&gt;hi&lt;/b&gt;'), kdArgs.slice(0, 60))
   delete process.env.DSA_FAKE_DIALOG_NAME
   unscripted('ok')
+}
+
+// --- N35–N39: a long line is folded, so the window stops at its width ------
+// The dialog neither wraps nor scrolls: a 300-character command made a 2074 px
+// wide window on the real binary, and the buttons sat off screen. The body is
+// folded on the Host instead, with a marker that keeps a fold from reading as a
+// second command.
+{
+  const original = `sudo tee /etc/${'a'.repeat(200)}.conf <<< ok`
+  const folded = foldLine(original)
+  const rejoined = folded.map((row, index) => (index === 0 ? row : row.slice(2))).join('')
+  check('N35 folding every character survives', rejoined === original, `${folded.length} rows`)
+  check('N36 every folded row fits the budget', folded.every((row) => row.length <= DIALOG_WRAP_COLUMNS))
+  check(
+    'N37 only continuation rows carry the marker',
+    folded.slice(1).every((row) => row.startsWith('↳ ')) && !folded[0].startsWith('↳ '),
+  )
+  // Wide characters count double, or a CJK line would still blow the width out.
+  const cjk = foldLine('sudo ' + '汉'.repeat(100))
+  check('N38 a wide-character line folds by display width', cjk.every((row) => row.length <= 44), String(cjk[0].length))
+
+  unscripted('cancel')
+  const { ctx, handlers } = makeCtx()
+  mod.apply(ctx, { passwordDialog: 'auto' })
+  await handlers.get('tools/pre-execute')(callExec(`sudo cat /var/log/${'b'.repeat(180)}.log`), () => 'dispatched')
+  const body = invocations()[0] ?? ''
+  check(
+    'N39 the dialog is asked for folded text',
+    body.split('\n').every((row) => row.length <= DIALOG_WRAP_COLUMNS) && body.includes('↳ '),
+    String(Math.max(...body.split('\n').map((row) => row.length))),
+  )
+  unscripted('ok')
+}
+
+// --- N40–N42: folding adds height, so a tall body is refused ---------------
+{
+  const tall = Array.from({ length: 7 }, () => `sudo echo ${'y'.repeat(390)}`).join('\n')
+  // Seven 400-character lines pass the line caps and still draw 42 rows, which
+  // is taller than the dialog: refuse rather than hide the last ones.
+  check('N40 the folded row count is what the cap measures', nativeRowCount([{ text: tall.split('\n')[0] }]) === 6, '')
+  const { ctx, handlers } = makeCtx()
+  mod.apply(ctx, { passwordDialog: 'auto' })
+  const verdict = await handlers.get('tools/pre-execute')(callExec(tall), () => 'dispatched')
+  check(
+    'N41 a body taller than the dialog is refused',
+    verdict?.kind === 'deny' && denyReason(verdict).includes('显示行') && denyReason(verdict).includes(String(NATIVE_MAX_ROWS)),
+    denyReason(verdict).slice(0, 40),
+  )
+  const denied = readFileSync(join(home, 'logs', 'dsh-sudo-approve.log'), 'utf8')
+    .split('\n')
+    .filter((line) => line.includes('"event":"denied"') && line.includes('"reason":"truncated"') && line.includes('"rows":42'))
+    .at(-1)
+  check('N42 the refusal records the folded row count', denied?.includes(`"rows":42`) === true && denied?.includes(`"rowCap":${NATIVE_MAX_ROWS}`) === true, denied?.slice(0, 80) ?? '')
 }
 
 // --- N22–N24: a rejection asks for a reason in a second dialog --------------
