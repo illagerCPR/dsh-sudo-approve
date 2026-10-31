@@ -133,6 +133,191 @@ check('C9 it admits the unknown instead of claiming coverage', flatSettings.incl
 // contain: a conditional row and the value that names the channel.
 check('C13 the settings page has a PTC channel row', src.includes("readonlyRow('programs'") && src.includes('coverageWithPrograms'))
 
+// --- an inactive Host explains itself instead of drawing the form ----------
+// The component is re-rendered for real here: a stateful fake React, a mocked
+// `/config` that answers `active: false`, and a mount/effect cycle that mirrors
+// what the browser does, because the defect lived in the second render (the
+// first one has no snapshot yet and used to look identical either way).
+const jsonResponse = (payload, status = 200) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  json: async () => payload,
+})
+
+{
+  const inactivePayload = {
+    build: 24,
+    active: false,
+    reason: 'sudo-not-trusted',
+    sudo: { path: '/usr/bin/sudo', check: 'untrusted-directory', mode: '777', candidates: ['/usr/bin/sudo'] },
+    store: '/tmp/dsh-sudo-approve.json',
+    auditLog: '/tmp/logs/dsh-sudo-approve.log',
+  }
+
+  const states = []
+  const effects = []
+  const cleanups = []
+  let hookAt = 0
+  let mounted = false
+  let component = undefined
+  let tree = undefined
+  const renderPanel = () => {
+    hookAt = 0
+    effects.length = 0
+    const next = component()
+    if (!mounted) {
+      mounted = true
+      for (const fn of effects) {
+        const cleanup = fn()
+        if (typeof cleanup === 'function') cleanups.push(cleanup)
+      }
+    }
+    return next
+  }
+  const StatefulReact = {
+    createElement: (type, props, ...children) => ({ type, props, children }),
+    useState: (initial) => {
+      const at = hookAt++
+      if (!(at in states)) states[at] = typeof initial === 'function' ? initial() : initial
+      const setValue = (next) => {
+        const value = typeof next === 'function' ? next(states[at]) : next
+        if (Object.is(value, states[at])) return
+        states[at] = value
+        Promise.resolve().then(() => {
+          tree = renderPanel()
+        })
+      }
+      return [states[at], setValue]
+    },
+    useCallback: (fn) => fn,
+    useEffect: (fn) => {
+      effects.push(fn)
+    },
+    useRef: (value) => ({ current: value }),
+  }
+
+  const seenUrls = []
+  globalThis.fetch = async (url) => {
+    const target = String(url)
+    seenUrls.push(target)
+    if (target.includes('/pending')) return jsonResponse({ ok: true, value: { requests: [], waiting: 0 } })
+    return jsonResponse({ ok: true, value: inactivePayload })
+  }
+
+  const inactiveRegistrations = []
+  const makeInactiveCtx = () => ({
+    effect: (fn) => {
+      const dispose = fn()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+    get: () => undefined,
+    inject: (_services, cb) => {
+      cb()
+      return { dispose: () => {} }
+    },
+    locale: { register: () => {}, bind: () => (key, params) => (params === undefined ? key : `${key}${JSON.stringify(params)}`) },
+    uiSession: { registerPendingInteraction: () => () => 0 },
+    slots: {
+      inject: (_name, cb) => cb(),
+      register: (spec, record) => {
+        inactiveRegistrations.push({ spec, component: record })
+        return () => {}
+      },
+    },
+  })
+
+  let inactiveModule
+  try {
+    inactiveModule = factory((name) => {
+      if (name === 'react') return StatefulReact
+      throw new Error(`unexpected require(${name})`)
+    })
+    inactiveModule.apply(makeInactiveCtx())
+    check('C14 the client loads against an inactive Host', typeof inactiveModule?.apply === 'function')
+  } catch (error) {
+    check('C14 the client loads against an inactive Host', false, error.message)
+  }
+
+  const spec = inactiveRegistrations.find((entry) => entry.spec.name === 'settings.section')
+  component = spec?.component
+  try {
+    // Mount first: the config request is started by this render's effect, so
+    // rendering after the wait would only ever see the pre-request state.
+    tree = renderPanel()
+    await new Promise((resolve) => setImmediate(resolve))
+    await new Promise((resolve) => setImmediate(resolve))
+    tree = renderPanel()
+  } catch (error) {
+    check('C15 the inactive settings section renders', false, error.message)
+  }
+  const flat = JSON.stringify(tree)
+  check('C15 the inactive settings section renders', tree !== undefined)
+  check('C16 it says the plugin is not running', flat.includes('inactiveTitle'))
+  check('C17 it never claims interception is on', !flat.includes('"key":"enabled"') && !flat.includes('"key":"dialog"'))
+  check('C18 it names the failed check and the path', flat.includes('inactiveReasonDir') && flat.includes('/usr/bin/sudo'))
+  check('C19 it points at the audit log', flat.includes('inactiveAudit'))
+  for (const cleanup of cleanups.splice(0)) {
+    try {
+      cleanup()
+    } catch {
+      // a torn-down page is not a test failure
+    }
+  }
+}
+
+// --- the pending poll stops once the Host says it has no such route --------
+{
+  let intervalFn = undefined
+  let cleared = 0
+  const previousSet = globalThis.window.setInterval
+  const previousClear = globalThis.window.clearInterval
+  globalThis.window.setInterval = (fn) => {
+    intervalFn = fn
+    return 42
+  }
+  globalThis.window.clearInterval = () => {
+    cleared += 1
+  }
+  let fetches = 0
+  globalThis.fetch = async () => {
+    fetches += 1
+    return { ok: false, status: 404, json: async () => ({ ok: false }) }
+  }
+
+  const pollRegistrations = []
+  const pollCtx = {
+    effect: (fn) => {
+      const dispose = fn()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+    get: () => undefined,
+    inject: (_services, cb) => {
+      cb()
+      return { dispose: () => {} }
+    },
+    locale: { register: () => {}, bind: () => (key) => key },
+    uiSession: { registerPendingInteraction: () => () => 0 },
+    slots: {
+      inject: (_name, cb) => cb(),
+      register: (spec, record) => {
+        pollRegistrations.push({ spec, component: record })
+        return () => {}
+      },
+    },
+  }
+  const pollModule = factory(requireFake)
+  pollModule.apply(pollCtx)
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  check('C20 a 404 from the pending route ends the poll', cleared === 1 && intervalFn !== undefined, `cleared=${cleared}`)
+  const after = fetches
+  if (typeof intervalFn === 'function') intervalFn()
+  await new Promise((resolve) => setImmediate(resolve))
+  check('C21 no further request is sent after that', fetches === after, `${after} -> ${fetches}`)
+  globalThis.window.setInterval = previousSet
+  globalThis.window.clearInterval = previousClear
+}
+
 const failed = results.filter((ok) => !ok).length
 console.log(`\n${results.length - failed}/${results.length} checks matched`)
 if (failed > 0) process.exitCode = 1

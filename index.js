@@ -35,16 +35,16 @@ import { MESSAGES } from './lib/messages.js'
 import { createNativeDialog, NATIVE_MAX_LINES, sampleDialogFacts } from './lib/native-dialog.js'
 import { createPtc } from './lib/ptc.js'
 import { installPrompt } from './lib/prompt.js'
-import { installRoutes } from './lib/routes.js'
+import { installInactiveRoute, installRoutes } from './lib/routes.js'
 import { createShim } from './lib/shim.js'
 import { createSudoAuth } from './lib/sudo-auth.js'
-import { resolveTrusted } from './lib/trusted.js'
+import { diagnoseTrust, resolveTrusted } from './lib/trusted.js'
 import { errorText, isPlainObject } from './lib/util.js'
 
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 23
+const BUILD = 24
 /** Fallback PATH when the Host process has none. */
 const FALLBACK_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
@@ -81,7 +81,39 @@ export function apply(ctx, rawConfig) {
   const realSudoedit = resolveTrusted('', SUDOEDIT_CANDIDATES)
 
   if (realSudo === undefined) {
-    audit({ event: 'inactive', reason: 'sudo-not-trusted' })
+    // Nothing below this point can run, so the Host has to say so *where the
+    // page looks*. The audit line alone was not enough: the settings page
+    // rendered a normal form — "启用拦截 ✓" included — for a gate that never
+    // intercepted anything, and only a small "读取配置失败" at the bottom hinted
+    // otherwise. The answer carries the failed check and its path, never a
+    // command or a secret.
+    const diagnosis = diagnoseTrust(config().sudoPath, SUDO_CANDIDATES)
+    audit({
+      event: 'inactive',
+      reason: 'sudo-not-trusted',
+      check: diagnosis.check,
+      path: diagnosis.path,
+      ...(diagnosis.mode === undefined ? {} : { mode: diagnosis.mode }),
+      ...(diagnosis.uid === undefined ? {} : { uid: diagnosis.uid }),
+    })
+    installInactiveRoute({
+      ctx,
+      name: NAME,
+      value: () => ({
+        build: BUILD,
+        active: false,
+        reason: 'sudo-not-trusted',
+        sudo: {
+          path: diagnosis.path,
+          check: diagnosis.check,
+          ...(diagnosis.mode === undefined ? {} : { mode: diagnosis.mode }),
+          ...(diagnosis.uid === undefined ? {} : { uid: diagnosis.uid }),
+          candidates: diagnosis.tried,
+        },
+        store: storePath,
+        auditLog,
+      }),
+    })
     return
   }
 

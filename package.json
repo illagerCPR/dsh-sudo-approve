@@ -54,6 +54,6 @@
     }
   },
   "scripts": {
-    "test": "node test/native.mjs && node test/client.mjs && node test/audit.mjs && node test/split.mjs && node test/coverage.mjs"
+    "test": "node test/native.mjs && node test/inactive.mjs && node test/client.mjs && node test/audit.mjs && node test/split.mjs && node test/coverage.mjs"
   }
 }

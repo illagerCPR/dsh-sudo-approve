@@ -97,6 +97,18 @@ window.__ModuleLoader__.load({
       settingsLoadFailed: '读取配置失败，请刷新页面重试。',
       settingsFileOnly: '只读：请在配置文件里修改',
       unitSeconds: '秒',
+      inactiveTitle: '未启用：sudo 二进制不可信',
+      inactiveDesc: '插件没有装上拦截，这页的设置不会生效，智能体执行 sudo 时也不会弹出确认。',
+      inactiveWhere: '检查的是 {path}',
+      inactiveReasonWritable: '该文件可被组或他人改写（权限 {mode}）',
+      inactiveReasonDir: '所在目录可被非 root 改写（{mode}）',
+      inactiveReasonNotRoot: '属主不是 root（uid {uid}）',
+      inactiveReasonNotExec: '没有可执行权限',
+      inactiveReasonNotFile: '不是普通文件',
+      inactiveReasonMissing: '找不到该文件',
+      inactiveReasonRelative: '不是绝对路径',
+      inactiveFix: '把上面这一项改回 root 所有、且不含组/他人写权限，然后重启 dsh web，再回到这一页。',
+      inactiveAudit: '审计日志：',
     }
 
     const en = {
@@ -172,6 +184,18 @@ window.__ModuleLoader__.load({
       settingsLoadFailed: 'Could not read the settings. Refresh the page and retry.',
       settingsFileOnly: 'Read-only: change it in the config file',
       unitSeconds: 's',
+      inactiveTitle: 'Not running: the sudo binary is not trusted',
+      inactiveDesc: 'Nothing is intercepted, the settings on this page have no effect, and a sudo call will not ask you for anything.',
+      inactiveWhere: 'Checked: {path}',
+      inactiveReasonWritable: 'that file is group- or world-writable (mode {mode})',
+      inactiveReasonDir: 'a directory above it can be rewritten by non-root ({mode})',
+      inactiveReasonNotRoot: 'it is not owned by root (uid {uid})',
+      inactiveReasonNotExec: 'it is not executable',
+      inactiveReasonNotFile: 'it is not a regular file',
+      inactiveReasonMissing: 'it does not exist',
+      inactiveReasonRelative: 'it is not an absolute path',
+      inactiveFix: 'Put that back to root ownership without group/world write, restart dsh web, then return to this page.',
+      inactiveAudit: 'Audit log: ',
     }
 
     const CSS = `
@@ -254,6 +278,10 @@ window.__ModuleLoader__.load({
 .dsa-link{box-sizing:border-box;padding:6px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer}
 .dsa-link:hover:enabled{background:var(--dsw-alias-bg-layer-2)}
 .dsa-link:disabled{opacity:.55;cursor:default}
+.dsa-set-inactive{display:flex;flex-direction:column;gap:6px;margin-top:10px;padding:12px 14px;border:1px solid var(--dsw-alias-state-error-secondary,var(--dsw-alias-border-l1));border-radius:12px;background:var(--dsw-alias-bg-layer-2)}
+.dsa-set-inactive-title{font-size:13px;font-weight:600;line-height:20px;color:var(--dsw-alias-state-error-primary)}
+.dsa-set-inactive-line{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);word-break:break-word}
+.dsa-set-inactive-code{font-family:var(--ds-font-family-code,ui-monospace,SFMono-Regular,Menlo,Consolas,monospace);color:var(--dsw-alias-label-primary)}
 `
 
     /** Copy is bound in `apply`; the panel is created per page, so one binding is enough. */
@@ -692,6 +720,59 @@ window.__ModuleLoader__.load({
         setStatus(t('settingsSaveFailed'))
       }
 
+      // Why a Host without a trusted sudo says so instead of showing the form:
+      // the rows below would present a gate that intercepts nothing as if it
+      // were on (the 1.0.2 report: "启用拦截 ✓" over a plugin that never loaded).
+      // An inactive Host answers `/config` with `active: false`.
+      if (snapshot !== undefined && snapshot.active === false) {
+        const sudo = snapshot.sudo || {}
+        const reason =
+          sudo.check === 'group-or-world-writable'
+            ? t('inactiveReasonWritable', { mode: String(sudo.mode ?? '') })
+            : sudo.check === 'untrusted-directory'
+              ? t('inactiveReasonDir', { mode: String(sudo.mode ?? '') })
+              : sudo.check === 'not-root-owned'
+                ? t('inactiveReasonNotRoot', { uid: String(sudo.uid ?? '') })
+                : sudo.check === 'not-executable'
+                  ? t('inactiveReasonNotExec')
+                  : sudo.check === 'not-a-file'
+                    ? t('inactiveReasonNotFile')
+                    : sudo.check === 'relative-path'
+                      ? t('inactiveReasonRelative')
+                      : t('inactiveReasonMissing')
+        return h(
+          'div',
+          { className: 'dsa-set' },
+          h('div', { key: 'head', className: 'dsa-set-head' }, [
+            h('h2', { key: 'title', className: 'dsa-set-title' }, t('settingsTitle')),
+            h('p', { key: 'desc', className: 'dsa-set-desc' }, t('settingsDesc')),
+          ]),
+          h('div', { key: 'inactive', className: 'dsa-set-inactive' }, [
+            h('div', { key: 'title', className: 'dsa-set-inactive-title' }, t('inactiveTitle')),
+            h('p', { key: 'desc', className: 'dsa-set-inactive-line' }, t('inactiveDesc')),
+            h(
+              'p',
+              { key: 'where', className: 'dsa-set-inactive-line' },
+              t('inactiveWhere', { path: String(sudo.path ?? '—') }),
+            ),
+            h('p', { key: 'why', className: 'dsa-set-inactive-line' }, reason),
+            h('p', { key: 'fix', className: 'dsa-set-inactive-line' }, t('inactiveFix')),
+            h(
+              'p',
+              { key: 'audit', className: 'dsa-set-inactive-line' },
+              `${t('inactiveAudit')}${String(snapshot.auditLog ?? '')}`,
+            ),
+          ]),
+          h('div', { key: 'foot', className: 'dsa-set-foot' }, [
+            h(
+              'div',
+              { key: 'status', className: 'dsa-set-status', 'data-error': true },
+              `build ${String(snapshot.build ?? '')} · ${String(snapshot.store ?? '')}`,
+            ),
+          ]),
+        )
+      }
+
       const values = (snapshot && snapshot.values) || {}
       const limits = (snapshot && snapshot.limits) || { timeoutMs: [5000, 900000], presenceWindowMs: [2000, 300000] }
       const ready = snapshot !== undefined
@@ -912,8 +993,25 @@ window.__ModuleLoader__.load({
         live.delete(id)
       }
 
+      /**
+       * The pending poll.
+       *
+       * A Host without a trusted sudo registers no pending route, so the answer
+       * is a 404 that will stay a 404 for as long as this page lives (a plugin
+       * only becomes active on a restart, which reloads this page). Polling it
+       * every 1.5 s forever is pure noise, so the first 404 ends the poll.
+       */
+      let pollTimer = 0
+      let hostAbsent = false
+      const stopPoll = () => {
+        if (pollTimer === 0) return
+        window.clearInterval(pollTimer)
+        pollTimer = 0
+      }
+
       /** Reconcile the local pending set with the Host snapshot. */
       const sync = async () => {
+        if (hostAbsent) return
         let response
         try {
           const visible = document.visibilityState === 'visible'
@@ -924,6 +1022,11 @@ window.__ModuleLoader__.load({
             headers: { accept: 'application/json' },
           })
         } catch {
+          return
+        }
+        if (response.status === 404) {
+          hostAbsent = true
+          stopPoll()
           return
         }
         if (!response.ok) return
@@ -948,12 +1051,12 @@ window.__ModuleLoader__.load({
       }
 
       ctx.effect(() => {
-        const timer = window.setInterval(() => {
+        pollTimer = window.setInterval(() => {
           sync().catch(() => {})
         }, POLL_MS)
         sync().catch(() => {})
         return () => {
-          window.clearInterval(timer)
+          stopPoll()
           for (const id of [...live.keys()]) drop(id)
         }
       }, `${NS}: pending poll`)
