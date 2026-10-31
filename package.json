@@ -1,6 +1,6 @@
 {
   "name": "dsh-sudo-approve",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "module",
   "description": "Ask before the agent runs sudo: replace the composer with the command list and a password prompt.",
   "license": "MIT",
