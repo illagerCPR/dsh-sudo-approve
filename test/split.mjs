@@ -27,7 +27,7 @@ function makeCtx(options = {}) {
   const connection = { allowsRemoteAuthorities: remote, fetch: { register: (route) => routes.set(route.path, route) } }
   const systemPrompt = { context: (spec) => contexts.push(spec), getContextOrder: () => 100 }
   const shell = { resolve: (request) => ({ command: request.command, workdir: '/tmp', timeoutMs: 1000 }) }
-  const tools = { get: (name) => (ptc && name === 'run_code' ? { name } : undefined) }
+  const tools = options.tools ?? { get: (name) => (ptc && name === 'run_code' ? { name } : undefined) }
   const get = (name) => {
     if (name === 'shell') return shell
     if (name === 'agents') return { roots: () => roots }
@@ -55,6 +55,7 @@ function makeCtx(options = {}) {
 }
 
 const mod = await import(`${root}/index.js`)
+const { programTransportsOf } = await import(`${root}/lib/agents.js`)
 const { createGate } = await import(`${root}/lib/gate.js`)
 const { createShim } = await import(`${root}/lib/shim.js`)
 const { digestOf } = await import(`${root}/lib/analysis.js`)
@@ -82,6 +83,42 @@ const { digestOf } = await import(`${root}/lib/analysis.js`)
   const { ctx, contexts } = makeCtx({ sandboxMode: 'workspace-write' })
   mod.apply(ctx, { passwordDialog: 'browser' })
   check('E7 a confined session is told nothing', contexts[0].text({ agent: { id: 'session-x', session: {} } }) === '')
+}
+
+// --- E8-E11: the DSH 0.2.2 executor-owned transport ------------------------
+{
+  // 0.2.2 forbids registering `run_code`; only the selected executor's
+  // describe() still names it. This is the shape the live Host has now.
+  let describedWith
+  const executorTools = (schemas) => ({
+    get: () => undefined,
+    selectExecutor: () => ({
+      describe: (tools) => {
+        describedWith = tools
+        return { schemas }
+      },
+    }),
+  })
+  const ptcCtx = makeCtx({ tools: executorTools([{ name: 'run_code' }]) }).ctx
+  check(
+    'E8 rc.1 PTC is recognised through the selected executor',
+    programTransportsOf(ptcCtx, { id: 'session-x' }).includes('run_code') && describedWith?.length === 0,
+  )
+  const nativeCtx = makeCtx({ tools: executorTools([]) }).ctx
+  check('E9 a native executor is not mistaken for PTC', programTransportsOf(nativeCtx, { id: 'session-x' }).length === 0)
+  const legacyCtx = makeCtx({ ptc: true }).ctx
+  check('E10 the pre-0.2.2 tools.get path still works', programTransportsOf(legacyCtx, { id: 'session-x' }).includes('run_code'))
+  const brokenCtx = makeCtx({
+    tools: {
+      get: () => {
+        throw new Error('registry unavailable')
+      },
+      selectExecutor: () => {
+        throw new Error('executor unavailable')
+      },
+    },
+  }).ctx
+  check('E11 an unreadable executor is treated as no program channel', programTransportsOf(brokenCtx, { id: 'session-x' }).length === 0)
 }
 
 // --- F: the route table ----------------------------------------------------

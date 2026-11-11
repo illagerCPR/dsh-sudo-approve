@@ -26,7 +26,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-import { RUN_CODE_NAME } from './lib/agents.js'
+import { programTransportsOf, RUN_CODE_NAME } from './lib/agents.js'
 import { createAudit } from './lib/audit.js'
 import { createSettings } from './lib/config.js'
 import { scanCoverage } from './lib/coverage.js'
@@ -44,7 +44,7 @@ import { errorText, isPlainObject } from './lib/util.js'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 24
+const BUILD = 25
 /** Fallback PATH when the Host process has none. */
 const FALLBACK_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
@@ -165,8 +165,24 @@ export function apply(ctx, rawConfig) {
     const list = typeof agents?.list === 'function' ? agents.list() : []
     return [undefined, ...list.filter((agent) => agent !== undefined)]
   }
+  /**
+   * Program transports the scopes' selected executors present.
+   *
+   * The registry cannot answer this on DSH 0.2.2: `run_code` is a reserved
+   * executor-owned transport and is excluded from both `tools.get()` and
+   * `tools.schemas()`. Asking each scope's executor keeps the answer scoped:
+   * a native Session must not be reported as having a PTC program channel.
+   */
+  const coveragePrograms = (scopes) => {
+    const programs = new Set()
+    for (const scope of scopes) {
+      for (const name of programTransportsOf(ctx, scope)) programs.add(name)
+    }
+    return [...programs]
+  }
   const coverageOf = () => {
-    const report = scanCoverage(ctx.get('tools'), config().toolNames, coverageScopes())
+    const scopes = coverageScopes()
+    const report = scanCoverage(ctx.get('tools'), config().toolNames, scopes, coveragePrograms(scopes))
     const stage = report.available ? 'final' : report.total > 0 ? 'partial' : 'none'
     if (stages[stage] > stages[coverageStage]) {
       coverageStage = stage

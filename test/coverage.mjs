@@ -81,6 +81,16 @@ const schema = (name, fields) => ({
   parameters: { type: 'object', properties: Object.fromEntries(fields.map((field) => [field, { type: 'string' }])) },
 })
 const registry = (schemas) => ({ schemas: () => schemas })
+/** DSH 0.2.2 shape: the transport belongs to the executor, not to the registry. */
+const executorRegistry = (schemas, ptcSessions = new Set()) => ({
+  ...registry(schemas),
+  get: () => undefined,
+  selectExecutor: (scope) => ({
+    describe: () => ({
+      schemas: scope !== undefined && ptcSessions.has(scope.id) ? [{ name: 'run_code' }] : [],
+    }),
+  }),
+})
 const names = new Set(['bash'])
 const readConfig = async (routes) => {
   const route = routes.get('/api/sudo-approve/config')
@@ -192,6 +202,54 @@ const readConfig = async (routes) => {
   const covered = await readConfig(routes)
   check('C30 the settings payload carries it too', Array.isArray(covered?.programs) && covered.programs.includes('run_code'), JSON.stringify(covered?.programs ?? null))
   dispose()
+}
+
+// --- DSH 0.2.2: run_code is executor-owned, never a registry schema --------
+{
+  const before = coverageLines().length
+  const { ctx, routes, dispose } = makeCtx({
+    tools: executorRegistry([schema('bash', ['command'])], new Set(['session-ptc'])),
+    agents: [{ id: 'session-ptc' }, { id: 'session-native' }],
+  })
+  mod.apply(ctx, { passwordDialog: 'browser' })
+  check(
+    'C31 a PTC executor is reported without a run_code schema',
+    coverageLines().length === before + 1 &&
+      lastCoverage().includes('"final":true') &&
+      lastCoverage().includes('"programs":["run_code"]'),
+    lastCoverage().slice(-100),
+  )
+  const covered = await readConfig(routes)
+  check(
+    'C32 the settings payload carries the executor-owned channel',
+    covered?.available === true && covered.programs?.includes('run_code') === true,
+    JSON.stringify({ available: covered?.available, programs: covered?.programs }),
+  )
+  dispose()
+}
+{
+  const before = coverageLines().length
+  const { ctx, routes, dispose } = makeCtx({
+    tools: executorRegistry([schema('bash', ['command'])]),
+    agents: [{ id: 'session-native' }],
+  })
+  mod.apply(ctx, { passwordDialog: 'browser' })
+  check(
+    'C33 a native executor is not reported as a program channel',
+    coverageLines().length === before + 1 && !lastCoverage().includes('"programs"'),
+    lastCoverage().slice(-80),
+  )
+  const covered = await readConfig(routes)
+  check('C34 its settings payload stays free of programs', covered?.programs?.length === 0, JSON.stringify(covered?.programs ?? null))
+  dispose()
+}
+{
+  const early = scanCoverage(undefined, names, [undefined], ['run_code'])
+  check(
+    'C35 a reported program survives an unready registry',
+    early.available === false && early.programs.includes('run_code'),
+    JSON.stringify(early.programs),
+  )
 }
 
 // --- a registry that appears only after apply ----------------------------
