@@ -173,6 +173,37 @@ zenity 的文本区不会自动换行：窗口按最长那一行撑开，`--widt
 
 **没有验证的部分**：只对 zenity 4.2.1 量了几何；kdialog 的折行逻辑走同一条 `dialogText`，但它的窗口宽度由 Qt 自己决定，本机没有装 kdialog，未量。
 
+## build 26：被包装程序的 `-h` 被当成了 sudo 的 `-h`（issue #1）
+
+shim 用 `for arg do` 遍历**全部**参数去找「不需要密码的元数据形式」，于是任何把裸 `-h` 传给被包装程序的命令（`df -h`、`free -h`、`dumpe2fs -h`、`ls -h`）都被判成 `sudo -h`，`-A` 被丢掉。后果不是「命令失败」这么轻：
+
+1. 真 sudo 没有 askpass 助手，PAM 收不到密码；
+2. 这表现为一次**普通的认证失败**，于是计入 `pam_faillock`；
+3. 默认 `deny=3`，三次就锁号——`system-auth` 里带 faillock 的机器上，SSH 一起锁。
+
+审计日志 meanwhile 记的是 `credential: askpass`、`finished`，看起来一切正常：`-A` 从未真正加上，而插件以为交付成功了。
+
+修法是**只看 `$1`**，与 `analysis.js` 里 `METADATA_ONLY_SUDO` 的判定口径对齐（那里本来就要求标志紧跟 `sudo` 且结束整行）。但 issue 建议的纯 `case "$1"` 还不够：sudo-rs 拒绝 `--reset-timestamp` 与 `--askpass` 同时出现，所以 `sudo -k ls` 这种「元数据标志 + 命令」的形式若丢掉 `-A`，会退化成 `sudo: A terminal is required to authenticate`。因此透传还要求 `$#` 为 1——只有**单独**的元数据形式才不需要 `-A`。
+
+| 命令 | 修前 | 修后 |
+| --- | --- | --- |
+| `sudo df -h` | `df -h`（丢 `-A`） | `-A df -h` |
+| `sudo dumpe2fs -h /dev/sda` | `dumpe2fs -h /dev/sda`（丢 `-A`） | `-A dumpe2fs -h /dev/sda` |
+| `sudo -k` | `-k` | `-k` |
+| `sudo -k ls` | `-k ls`（丢 `-A`） | `-A -k ls` |
+
+**次生问题：锁号被报成「密码不正确」。** `pam_faillock` 的 `preauth` 在**校验密码之前**就拒绝，所以锁号期间每个密码都失败，包括正确的那个。插件原来把它读成「密码错」，于是提示「密码连续 3 次不正确」——用户会一直重试，而每次重试都在续命这把锁。本机实测：`sudo -k -S -v` 在锁号时只输出 `sudo: Authentication failed, try again.`，与真·密码错误**逐字相同**，所以不能只靠 stderr 分辨。
+
+现在 `authenticate()` 返回 `{ ok, reason }`，`reason` 为 `locked` / `wrong-password` / `unknown`：
+
+- **校验前**先读 `faillock --user` 的计数（`deny` 从 `/etc/security/faillock.conf` 读，缺省 3）。已经锁了就不再去撞 PAM——**不再新增失败记录**，这是关键：原来的重试循环本身在延长锁定。
+- 校验后若失败，先看 sudo 的 stderr 有没有 PAM 的锁号文案（`preauth` 没加 `silent` 时才有），再看一次计数。
+- 两个信号都拿不到时返回 `unknown`，**不**当作「密码错」——宁可让文案保留锁号的可能，也不把锁号说成密码错。
+
+两个界面都改了：native 对话框遇到 `locked` 直接拒绝并说明「密码本身没有错，请先 `faillock --reset`」，不再重开密码框；网页面板返回 `sudo-approve/locked-out`（HTTP 423），且**保留已输入的密码**——重打一个正确的密码只会再记一次失败。请求本身不结清，解锁后同一个面板还能继续用。
+
+**没有验证的部分**：本机（Ubuntu 26.04 / sudo-rs 0.2.13）的 `/var/run/faillock` 不存在，`faillock --user` 读不到 tally，所以 `locked` 分支只用假 sudo 与假探针验证过，**没有在真锁号的机器上跑通**。issue 报告的环境是 Arch + sudo 1.9.17p2 + `pam_faillock` 在 `system-auth` 里，那里的 tally 可读性未实测。`faillock` 二进制按 `lib/trusted` 的规则从固定路径解析（`/usr/sbin`、`/sbin`、`/usr/bin`、`/bin`），不走 `PATH`。
+
 ## 当前残余风险（有意接受）
 
 1. **文本识别仍可被绕过**。用引号拼接（`s""udo`）、命令替换（`$(printf …)`）、把命令写进脚本文件再 `bash` 它、`source`/`eval` 之类完全不出现这个词的写法，插件拦不住。这台机器上 sudo 在无终端时无法索取密码，所以这类命令通常直接失败；但若时间戳缓存仍然有效、或同一条命令里已经有一行被批准的 sudo（同一进程树共享缓存与临时 `sudo`），它们就能成功。
@@ -194,8 +225,9 @@ zenity 的文本区不会自动换行：窗口按最长那一行撑开，`--widt
 |---|---|
 | `lib/analysis.js` | 面板显示什么：续行折叠、逐行扫描、`sudo` 词元、截断判定、命令摘要 |
 | `lib/gate.js` | 面板与队列、在线/手势判定、核对码的生成与下发、`decide` 的全部拒绝分支、`armed` 的发放与复核 |
-| `lib/shim.js` | PATH shim 与 askpass 助手的生成/清理，以及把 PATH 注入单次 spawn 的 `shell.resolve` 包装 |
-| `lib/sudo-auth.js` | 密码校验、时间戳缓存探测与清除、一次性凭据交付（两条路径都会 `sudo -k`） |
+| `lib/shim.js` | PATH shim 与 askpass 助手的生成/清理，以及把 PATH 注入单次 spawn 的 `shell.resolve` 包装。shim 只看 `$1` 且要求 `$#` 为 1 才透传元数据形式（build 26） |
+| `lib/sudo-auth.js` | 密码校验（`authenticate` 区分锁号/密码错）、时间戳缓存探测与清除、一次性凭据交付（两条路径都会 `sudo -k`） |
+| `lib/lockout.js` | 锁号判定：`faillock --user` 计数、`deny` 读取、sudo stderr 的 PAM 锁号文案 |
 | `lib/config.js` | 配置解析与覆盖文件；哪些键网页可改、哪些只认文件 |
 | `lib/routes.js` | 三个 Fetch 路由；「手势快照先于 `notePresence`」就在这里 |
 | `lib/prompt.js` | 告诉模型怎么调用 sudo（原生 / PTC 两种形态二选一） |

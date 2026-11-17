@@ -479,6 +479,29 @@ if (passwordRequired) {
   delete process.env.DSA_FAKE_DIALOG_NAME
 }
 
+// --- N43–N45: a lockout is refused as a lockout, not as a typo -------------
+// Issue #1, secondary: pam_faillock's preauth rejects before the password is
+// checked, so once the tally reaches deny every password fails. Re-opening the
+// dialog would invite the operator to retype a correct password and keep the
+// lock alive, so the request is refused with the reason that actually applies.
+{
+  const { createNativeDialog } = await import(`${root}/lib/native-dialog.js`)
+  const { analyzeCommand } = await import(`${root}/lib/analysis.js`)
+  const analysis = analyzeCommand('sudo id -un')
+  const auditLines = []
+  const dialog = createNativeDialog({
+    audit: (event) => auditLines.push(event),
+    authenticate: async () => ({ ok: false, reason: 'locked', detail: '3/3' }),
+  })
+  scripted('ok')
+  const outcome = await dialog.ask({ analysis, code: 'ABCDEF', waitMs: 5_000, signal: undefined })
+  check('N43 a locked account is refused, not re-asked', outcome.kind === 'rejected', JSON.stringify(outcome.kind))
+  check('N44 the reason names the lockout and the fix', /faillock/.test(outcome.reason ?? '') && /锁定/.test(outcome.reason ?? ''), String(outcome.reason).slice(0, 30))
+  check('N45 only one dialog was shown', invocations().length === 1, String(invocations().length))
+  check('N46 the lockout is audited as such', auditLines.some((line) => line.event === 'locked-out'), JSON.stringify(auditLines.map((line) => line.event)))
+  unscripted('ok')
+}
+
 for (const dispose of disposers) {
   try {
     dispose()

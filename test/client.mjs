@@ -132,6 +132,10 @@ check('C9 it admits the unknown instead of claiming coverage', flatSettings.incl
 // this fake snapshot cannot reach that state, so check what the source must
 // contain: a conditional row and the value that names the channel.
 check('C13 the settings page has a PTC channel row', src.includes("readonlyRow('programs'") && src.includes('coverageWithPrograms'))
+// Issue #1: a lockout must not be shown as a wrong password, and the password
+// must survive it — retyping a correct one only adds another failure.
+check('C14 the page has a lockout message', src.includes('lockedOut') && src.includes('faillock --reset'))
+check('C15 the lockout code is handled apart from a wrong password', src.includes("'sudo-approve/locked-out'"))
 
 // --- an inactive Host explains itself instead of drawing the form ----------
 // The component is re-rendered for real here: a stateful fake React, a mocked

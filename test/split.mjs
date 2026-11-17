@@ -1,7 +1,7 @@
 // split-seam harness — the parts test/audit.mjs never touched:
 // the runtime-context paragraph, the armed hand-off, the shim roundtrip and the
 // route table. Drives the real modules, never the live Host.
-import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -193,6 +193,83 @@ const { digestOf } = await import(`${root}/lib/analysis.js`)
   check('H5 the directory is gone afterwards', !existsSync(run.root))
   await shim.sweepStaleRuns()
   check('H6 nothing stale is left in the runtime dir', readdirSync(process.env.XDG_RUNTIME_DIR).length === 0, readdirSync(process.env.XDG_RUNTIME_DIR).join(','))
+}
+
+// --- I: the shim only reads sudo's own leading option ----------------------
+// Issue #1: `for arg do` scanned the whole argv, so a wrapped program's own `-h`
+// (`df -h`, `free -h`, `dumpe2fs -h`) was taken for sudo's and `-A` was dropped.
+// sudo then had no askpass helper, PAM saw no password, and the failure counted
+// against pam_faillock — three of them reached the default deny=3 and locked the
+// account out of sudo. The shim is driven here against a fake sudo that only
+// echoes its argv, so no PAM is involved.
+{
+  const { spawnSync } = await import('node:child_process')
+  const { AsyncLocalStorage } = await import('node:async_hooks')
+  const scope = new AsyncLocalStorage()
+  const fakeDir = mkdtempSync(join(tmpdir(), 'dsa-shim-fake-'))
+  const fake = join(fakeDir, 'fake-sudo')
+  writeFileSync(fake, '#!/bin/sh\nprintf "%s\\n" "$*"\n')
+  chmodSync(fake, 0o755)
+  const shim = createShim({
+    name: 'dsh-sudo-approve',
+    scope,
+    basePath: '/usr/bin:/bin',
+    realSudo: { path: fake },
+    realSudoedit: undefined,
+    audit: () => {},
+  })
+  const run = await shim.materialize('hunter2')
+  /** Run the generated shim with these arguments and return its argv echo. */
+  const argvOf = (...args) => spawnSync(join(run.bin, 'sudo'), args, { encoding: 'utf8' }).stdout.trim()
+
+  // The regression itself: a bare -h belongs to the wrapped program.
+  check('I1 sudo df -h keeps -A', argvOf('df', '-h') === '-A df -h', argvOf('df', '-h'))
+  check('I2 sudo dumpe2fs -h keeps -A', argvOf('dumpe2fs', '-h', '/dev/sda') === '-A dumpe2fs -h /dev/sda', argvOf('dumpe2fs', '-h', '/dev/sda'))
+  check('I3 sudo free -h keeps -A', argvOf('free', '-h') === '-A free -h', argvOf('free', '-h'))
+  check('I4 a trailing -h keeps -A', argvOf('ls', '-l', '-h') === '-A ls -l -h', argvOf('ls', '-l', '-h'))
+  check('I5 a combined -lh keeps -A', argvOf('ls', '-lh') === '-A ls -lh', argvOf('ls', '-lh'))
+  // sudo's own metadata forms still pass through untouched: sudo-rs refuses
+  // --reset-timestamp together with --askpass, so adding -A would break them.
+  check('I6 sudo -k passes through', argvOf('-k') === '-k', argvOf('-k'))
+  check('I7 sudo -K passes through', argvOf('-K') === '-K', argvOf('-K'))
+  check('I8 sudo -V passes through', argvOf('-V') === '-V', argvOf('-V'))
+  check('I9 sudo -h passes through', argvOf('-h') === '-h', argvOf('-h'))
+  check('I10 sudo --reset-timestamp passes through', argvOf('--reset-timestamp') === '--reset-timestamp', argvOf('--reset-timestamp'))
+  // A metadata flag followed by a command does authenticate, so it takes -A.
+  check('I11 sudo -k ls keeps -A', argvOf('-k', 'ls') === '-A -k ls', argvOf('-k', 'ls'))
+  check('I12 sudo -u root id keeps -A', argvOf('-u', 'root', 'id') === '-A -u root id', argvOf('-u', 'root', 'id'))
+  await shim.dematerialize(run)
+  rmSync(fakeDir, { recursive: true, force: true })
+}
+
+// --- J: a lockout is not reported as a wrong password ---------------------
+// Issue #1, secondary: pam_faillock's preauth rejects before the password is
+// checked, so every password fails once the tally reaches deny. Reading that as
+// "wrong password" sends the operator into a retry loop that keeps the lock
+// alive. The probe and the marker are pure, so they are tested directly.
+{
+  const { denyFrom, lockoutMarker, validFailures, DEFAULT_DENY } = await import(`${root}/lib/lockout.js`)
+  check('J1 the default deny is 3', DEFAULT_DENY === 3)
+  check('J2 deny is read from faillock.conf', denyFrom('deny = 5\nunlock_time = 600\n') === 5)
+  check('J3 a commented deny is ignored', denyFrom('# deny = 9\ndeny = 4\n') === 4)
+  check('J4 an unreadable conf falls back to the default', denyFrom(undefined) === DEFAULT_DENY)
+  check('J5 a malformed deny falls back to the default', denyFrom('deny = many\n') === DEFAULT_DENY)
+
+  const table = [
+    'illager_aris:',
+    'When                Type  Source                                           Valid',
+    '2026-11-17 18:38:19 V     sudo                                              V',
+    '2026-11-17 18:38:21 V     sudo                                              V',
+    '2026-11-17 18:38:23 V     sudo                                              I',
+  ].join('\n')
+  check('J6 only valid rows are counted', validFailures(table) === 2, String(validFailures(table)))
+  check('J7 a missing table is unknown, not zero', validFailures('') === undefined)
+  check('J8 an empty table counts zero', validFailures('u:\nWhen                Type  Source                                           Valid\n') === 0)
+
+  check('J9 PAM lockout text is recognised', lockoutMarker('sudo: Account validation failure, is your account locked?') !== undefined)
+  check('J10 "temporarily locked" is recognised', lockoutMarker('pam_faillock: account temporarily locked') !== undefined)
+  check('J11 an ordinary failure is not a lockout', lockoutMarker('sudo: Authentication failed, try again.') === undefined)
+  check('J12 empty stderr is not a lockout', lockoutMarker('') === undefined)
 }
 
 // The lifecycle effect owns a 30 s timer, so every install is torn down here;

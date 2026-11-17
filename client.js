@@ -36,6 +36,7 @@ window.__ModuleLoader__.load({
       working: '处理中…',
       remembered: '已记住本次会话的密码：这次不用再输入，点「允许并执行」即以它放行。记住期间，任何能在本页面执行脚本的东西都可以在你不动手的情况下批准。',
       invalidPassword: '密码不正确，请重试。',
+      lockedOut: '账户已被 pam_faillock 锁定，密码本身没有错。请先在终端运行 faillock --reset 解锁，再点「允许并执行」。',
       passwordRequired: '请输入密码。',
       stale: '该请求已失效。',
       noInteraction: '这次批准没有被识别为页面上的真实操作，请重新点击一次。',
@@ -123,6 +124,7 @@ window.__ModuleLoader__.load({
       working: 'Working…',
       remembered: 'This session holds the password already, so this approval reuses it. While it is remembered, anything that can run script in this page can approve without you.',
       invalidPassword: 'Wrong password. Try again.',
+      lockedOut: 'The account is locked by pam_faillock — the password itself is fine. Run faillock --reset in a terminal, then click Allow and run again.',
       passwordRequired: 'Enter the password.',
       stale: 'This request is no longer pending.',
       noInteraction: 'The approval was not recognised as a real click on this page. Try again.',
@@ -474,6 +476,10 @@ window.__ModuleLoader__.load({
           if (code === 'sudo-approve/invalid-password') {
             setPassword('')
             setError(t('invalidPassword'))
+          } else if (code === 'sudo-approve/locked-out') {
+            // The password is not the problem, so it is kept: retyping a correct
+            // one would only add another failure to the tally.
+            setError(t('lockedOut'))
           } else if (code === 'sudo-approve/password-required') {
             setError(t('passwordRequired'))
           } else if (code === 'sudo-approve/stale') {

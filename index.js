@@ -31,6 +31,7 @@ import { createAudit } from './lib/audit.js'
 import { createSettings } from './lib/config.js'
 import { scanCoverage } from './lib/coverage.js'
 import { createGate } from './lib/gate.js'
+import { createLockoutProbe } from './lib/lockout.js'
 import { MESSAGES } from './lib/messages.js'
 import { createNativeDialog, NATIVE_MAX_LINES, sampleDialogFacts } from './lib/native-dialog.js'
 import { createPtc } from './lib/ptc.js'
@@ -44,7 +45,7 @@ import { errorText, isPlainObject } from './lib/util.js'
 /** Plugin identity used in route paths, log lines and dir prefixes. */
 const NAME = 'dsh-sudo-approve'
 /** Bumped whenever a change has to be confirmed as live in the running Host. */
-const BUILD = 25
+const BUILD = 26
 /** Fallback PATH when the Host process has none. */
 const FALLBACK_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
@@ -267,11 +268,12 @@ export function apply(ctx, rawConfig) {
     config,
     audit,
     shim,
+    lockout: createLockoutProbe(),
   })
 
   const ptc = createPtc({ ctx, config })
 
-  const nativeDialog = createNativeDialog({ audit, validatePassword: sudoAuth.validatePassword })
+  const nativeDialog = createNativeDialog({ audit, authenticate: sudoAuth.authenticate })
 
   const gate = createGate({ ctx, config, audit, remembered, ptc, surfaceOf, nativeDialog })
 
@@ -284,7 +286,7 @@ export function apply(ctx, rawConfig) {
     settings,
     gate,
     remembered,
-    validatePassword: sudoAuth.validatePassword,
+    authenticate: sudoAuth.authenticate,
     surfaceOf,
     coverageOf,
   })

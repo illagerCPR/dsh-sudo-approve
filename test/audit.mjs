@@ -208,6 +208,89 @@ const auditLines = () => readFileSync(join(home, 'logs', 'dsh-sudo-approve.log')
   check('D3 a tiny presence window is clamped up', narrow.value.values.presenceWindowMs === 2_000, String(narrow.value?.values?.presenceWindowMs))
 }
 
+// ------------------------------- E. a lockout is not a wrong password
+// Issue #1, secondary: the page must say "locked", not "wrong password", or the
+// operator retypes a correct password and keeps the tally alive.
+{
+  const { createSudoAuth } = await import(`${root}/lib/sudo-auth.js`)
+  const { mkdtempSync: mkdtemp, writeFileSync: write, chmodSync } = await import('node:fs')
+  const dir = mkdtemp(join(tmpdir(), 'dsa-lock-'))
+  const fake = join(dir, 'fake-sudo')
+  write(fake, '#!/bin/sh\ncat >/dev/null\nexit 1\n')
+  chmodSync(fake, 0o755)
+
+  /** Build a sudo-auth whose lockout probe answers with `locked`. */
+  const authWith = (locked) =>
+    createSudoAuth({
+      realSudo: { path: fake },
+      basePath: '/usr/bin:/bin',
+      scope: { run: (_run, fn) => fn(), getStore: () => undefined },
+      config: () => ({ credential: 'askpass' }),
+      audit: () => {},
+      shim: {},
+      lockout: { read: async () => ({ locked, source: 'faillock', detail: '3/3' }) },
+    })
+
+  const locked = await authWith(true).authenticate('correct-password')
+  check('E1 a locked account is reported as locked', locked.ok === false && locked.reason === 'locked', JSON.stringify(locked))
+  const open = await authWith(false).authenticate('wrong-password')
+  check('E2 an unlocked account still reports a wrong password', open.ok === false && open.reason === 'wrong-password', JSON.stringify(open))
+
+  // The page route must carry the distinct code, and must not settle the request.
+  // The route is driven directly here: the real probe cannot read this machine's
+  // tally, so a full install would answer "wrong password" and test nothing.
+  const { installRoutes } = await import(`${root}/lib/routes.js`)
+  const routes = new Map()
+  const settled = []
+  const pendingRequest = {
+    id: 'req-locked',
+    sessionId: 'session-x',
+    dialog: 'browser',
+    resolving: false,
+    settle: (value) => settled.push(value),
+  }
+  const gate = {
+    current: () => pendingRequest,
+    notePresence: () => {},
+    interactionPresent: () => true,
+    snapshot: () => ({ requests: [pendingRequest], waiting: 0 }),
+  }
+  const routeCtx = {
+    effect: (fn) => fn(),
+    inject: (_services, cb) => {
+      cb({ get: () => ({ fetch: { register: (route) => routes.set(route.path, route) } }) })
+      return { dispose: () => {} }
+    },
+  }
+  installRoutes({
+    ctx: routeCtx,
+    name: 'dsh-sudo-approve',
+    config: () => ({ remember: 'never' }),
+    audit: (event) => auditLines().length,
+    settings: { snapshot: () => ({}), reset: () => [], save: () => {} },
+    gate,
+    remembered: new Map(),
+    authenticate: async () => ({ ok: false, reason: 'locked', detail: '3/3' }),
+    surfaceOf: () => ({ mode: 'browser', missing: [], maxLines: 60 }),
+    coverageOf: () => undefined,
+  })
+
+  const respondRoute = routes.get('/api/sudo-approve/respond')
+  const answer = await (
+    await respondRoute.fetch(
+      new Request('http://127.0.0.1:3080/api/sudo-approve/respond?state=visible&interaction=1', {
+        method: 'POST',
+        body: JSON.stringify({ id: 'req-locked', decision: 'approve', interaction: true, password: 'correct-password' }),
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+  ).json()
+  check('E3 the page is told it is a lockout', answer.error?.code === 'sudo-approve/locked-out', answer.error?.code)
+  check('E4 the message points at faillock --reset', /faillock --reset/.test(answer.error?.message ?? ''), String(answer.error?.message).slice(0, 30))
+  check('E5 the request is not settled, so it can be retried after unlocking', settled.length === 0, JSON.stringify(settled))
+  rmSync(dir, { recursive: true, force: true })
+}
+
 const failed = results.filter((entry) => !entry.ok)
 console.log(`\n${results.length - failed.length}/${results.length} checks matched`)
 rmSync(home, { recursive: true, force: true })
