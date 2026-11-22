@@ -7,6 +7,7 @@ import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { fakeSubagents } from './fake-subagents.mjs'
 const root = fileURLToPath(new URL('..', import.meta.url))
 
 const home = mkdtempSync(join(tmpdir(), 'dsa-cov-home-'))
@@ -41,7 +42,8 @@ function makeCtx(options = {}) {
   const shell = { resolve: (request) => ({ command: request.command, workdir: '/tmp', timeoutMs: 1000 }) }
   const get = (name) => {
     if (name === 'shell') return shell
-    if (name === 'agents') return { roots: () => [{ id: 'session-x' }], list: () => options.agents ?? [] }
+    if (name === 'agents') return { list: () => options.agents ?? [] }
+    if (name === 'subagents') return fakeSubagents()
     if (name === 'sandboxPolicy') return { resolve: () => ({ mode: 'danger-full-access' }) }
     if (name === 'connection') return connection
     if (name === 'systemPrompt') return systemPrompt

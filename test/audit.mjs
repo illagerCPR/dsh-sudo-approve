@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { fakeSubagents } from './fake-subagents.mjs'
 const root = fileURLToPath(new URL('..', import.meta.url))
 
 const home = mkdtempSync(join(tmpdir(), 'dsa-b13-home-'))
@@ -27,7 +28,8 @@ function makeCtx() {
   }
   const get = (name) => {
     if (name === 'shell') return { resolve: (request) => ({ command: request.command, workdir: '/tmp', timeoutMs: 1000 }) }
-    if (name === 'agents') return { roots: () => [{ id: 'session-x' }] }
+    if (name === 'agents') return { list: () => [{ id: 'session-x' }] }
+    if (name === 'subagents') return fakeSubagents()
     if (name === 'sandboxPolicy') return { resolve: () => ({ mode: 'danger-full-access' }) }
     if (name === 'connection') return connection
     return undefined

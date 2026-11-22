@@ -9,6 +9,7 @@ import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { fakeSubagents } from './fake-subagents.mjs'
 const root = fileURLToPath(new URL('..', import.meta.url))
 
 const home = mkdtempSync(join(tmpdir(), 'dsa-inactive-home-'))
@@ -43,6 +44,7 @@ function makeCtx() {
     if (name === 'systemPrompt') return systemPrompt
     if (name === 'shell') return shell
     if (name === 'agents') return { list: () => [] }
+    if (name === 'subagents') return fakeSubagents([])
     if (name === 'sandboxPolicy') return { resolve: () => ({ mode: 'danger-full-access' }) }
     if (name === 'tools') return { schemas: () => [] }
     return undefined

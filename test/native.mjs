@@ -9,6 +9,7 @@ import { register } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { fakeSubagents } from './fake-subagents.mjs'
 const root = fileURLToPath(new URL('..', import.meta.url))
 
 // A real password prompt is a property of this machine, not of the code: on a
@@ -113,7 +114,8 @@ function makeCtx(options = {}) {
   const shell = { resolve: (request) => ({ command: request.command, workdir: '/tmp', timeoutMs: 1000 }) }
   const get = (name) => {
     if (name === 'shell') return shell
-    if (name === 'agents') return { roots: () => roots }
+    if (name === 'agents') return { list: () => roots }
+    if (name === 'subagents') return fakeSubagents(roots)
     if (name === 'sandboxPolicy') return { resolve: () => ({ mode: 'danger-full-access' }) }
     if (name === 'connection') return connection
     if (name === 'systemPrompt') return systemPrompt

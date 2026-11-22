@@ -5,6 +5,8 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, w
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { fakeSubagents } from './fake-subagents.mjs'
+
 const root = fileURLToPath(new URL('..', import.meta.url))
 
 const home = mkdtempSync(join(tmpdir(), 'dsa-split-home-'))
@@ -30,7 +32,8 @@ function makeCtx(options = {}) {
   const tools = options.tools ?? { get: (name) => (ptc && name === 'run_code' ? { name } : undefined) }
   const get = (name) => {
     if (name === 'shell') return shell
-    if (name === 'agents') return { roots: () => roots }
+    if (name === 'agents') return { list: () => roots }
+    if (name === 'subagents') return options.subagents ?? fakeSubagents(roots)
     if (name === 'sandboxPolicy') return { resolve: () => ({ mode: sandboxMode }) }
     if (name === 'connection') return connection
     if (name === 'systemPrompt') return systemPrompt
@@ -55,7 +58,7 @@ function makeCtx(options = {}) {
 }
 
 const mod = await import(`${root}/index.js`)
-const { programTransportsOf } = await import(`${root}/lib/agents.js`)
+const { isRootAgent, programTransportsOf } = await import(`${root}/lib/agents.js`)
 const { createGate } = await import(`${root}/lib/gate.js`)
 const { createShim } = await import(`${root}/lib/shim.js`)
 const { digestOf } = await import(`${root}/lib/analysis.js`)
@@ -83,6 +86,35 @@ const { digestOf } = await import(`${root}/lib/analysis.js`)
   const { ctx, contexts } = makeCtx({ sandboxMode: 'workspace-write' })
   mod.apply(ctx, { passwordDialog: 'browser' })
   check('E7 a confined session is told nothing', contexts[0].text({ agent: { id: 'session-x', session: {} } }) === '')
+}
+
+// --- E12-E18: DSH 0.2.2 root detection -------------------------------------
+// 0.2.2 removed agents.roots(); the subagent service's rootOf() replaced it.
+// The gate and the paragraph must both keep answering from that one seam.
+{
+  const { ctx, contexts } = makeCtx()
+  mod.apply(ctx, { passwordDialog: 'browser' })
+  const rootAgent = { id: 'session-x', session: {} }
+  const childAgent = { id: 'session-child', session: {} }
+  check('E12 a root is recognised without agents.roots()', isRootAgent(ctx, rootAgent) === true)
+  check('E13 a child of that root is refused', isRootAgent(ctx, childAgent) === false)
+  check('E14 the root still gets the paragraph', contexts[0].text({ agent: rootAgent }).includes('a foreground `bash` call'))
+  check('E15 the child gets no paragraph', contexts[0].text({ agent: childAgent }) === '')
+}
+{
+  const throwing = { get: (name) => (name === 'subagents' ? { rootOf: () => { throw new Error('no runtime owner') } } : undefined) }
+  check('E16 a rootOf() failure is a refusal', isRootAgent(throwing, { id: 'session-x' }) === false)
+}
+{
+  const legacy = { get: (name) => (name === 'agents' ? { roots: () => [{ id: 'session-x' }] } : undefined) }
+  check('E17 the pre-0.2.2 registry fallback still answers', isRootAgent(legacy, { id: 'session-x' }) === true)
+  check('E18 neither service is a refusal', isRootAgent({ get: () => undefined }, { id: 'session-x' }) === false)
+}
+{
+  // rootOf() is documented to return the live root, so an equal id on another
+  // object is not that root; identity is what the live manager itself compares.
+  const clone = { get: (name) => (name === 'subagents' ? { rootOf: () => ({ id: 'session-x' }) } : undefined) }
+  check('E19 a same-id clone is not accepted as the root', isRootAgent(clone, { id: 'session-x' }) === false)
 }
 
 // --- E8-E11: the DSH 0.2.2 executor-owned transport ------------------------
